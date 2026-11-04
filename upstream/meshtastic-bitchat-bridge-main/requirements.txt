@@ -1,0 +1,5 @@
+bleak
+meshtastic
+pynacl
+lz4
+PubSub

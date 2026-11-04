@@ -1,0 +1,17 @@
+{
+  "name": "MeshBridge",
+  "chat": {
+    "kind": "channel",
+    "index": 0
+  },
+  "ble_scan_seconds": 3.0,
+  "bitchat_target": "",
+  "full_sync": false,
+  "history_limit": 100,
+  "lora_send_interval": 10.0,
+  "lora_stale_seconds": 1800,
+  "log_file": "bridge.log",
+  "log_truncate_seconds": 300,
+  "quiet": true,
+  "menu": true
+}
