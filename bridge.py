@@ -653,8 +653,96 @@ def scan_ble_devices(seconds: float = 8.0) -> List[dict]:
     return found
 
 
-def scan_bitchat_peers(seconds: float = 8.0) -> List[dict]:
-    """Find nearby phones that run Bitchat (BLE advertisers)."""
+def _probe_announce_packet() -> bytes:
+    """A signed announce used only while identifying nearby phones."""
+    probe = BitchatBLEHandler(None, "MeshBridge")  # type: ignore[arg-type]
+    return probe.build_announce()
+
+
+def _peer_identity(address: str, seconds: float = 5.0,
+                   announce: Optional[bytes] = None) -> dict:
+    """Briefly connect to one Bitchat phone to learn its user id and nickname.
+
+    The Bitchat user id (e.g. ``@Alex``) lives in the announce packet, so
+    it cannot be read from the advertisement — only from the GATT connection.
+    The bridge sends its own announce, waits for the peer's announce, and
+    disconnects again; no messages are forwarded during this probe.
+    """
+    if announce is None:
+        with contextlib.suppress(Exception):
+            announce = _probe_announce_packet()
+
+    async def _probe():
+        client = BleakClient(address, timeout=8.0)
+        result = {"user_id": None, "nickname": None}
+        try:
+            await client.connect()
+            try:
+                await client.start_notify(
+                    BITCHAT_CHAR_UUID,
+                    lambda _c, data: _parse_peer(data, result))
+            except Exception:  # noqa: BLE001
+                pass
+
+            if announce:
+                try:
+                    await client.write_gatt_char(BITCHAT_CHAR_UUID, announce,
+                                                 response=True)
+                except Exception:  # noqa: BLE001
+                    with contextlib.suppress(Exception):
+                        await client.write_gatt_char(BITCHAT_CHAR_UUID,
+                                                     announce, response=False)
+
+            deadline = time.time() + seconds
+            while time.time() < deadline and result["user_id"] is None:
+                await asyncio.sleep(0.1)
+        finally:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+        return result
+
+    def _parse_peer(data: bytearray, result: dict) -> None:
+        parsed = BitchatBLEHandler._parse_packet(bytes(data))
+        if not parsed:
+            return
+        sender, packet_type, _ts, _flags, payload = parsed
+        if packet_type != TYPE_ANNOUNCE:
+            return
+        result["user_id"] = "@" + sender.hex()[-4:]
+        nickname = BitchatBLEHandler._parse_announce_nickname(payload)
+        if nickname:
+            result["nickname"] = nickname
+
+    try:
+        return asyncio.run(_probe())
+    except Exception:  # noqa: BLE001
+        return {"user_id": None, "nickname": None}
+
+
+def _identify_peers(devices: List[dict], seconds: float = 5.0) -> None:
+    """Fill user_id/nickname for all found phones, in parallel."""
+    if not devices:
+        return
+    announce = None
+    with contextlib.suppress(Exception):
+        announce = _probe_announce_packet()
+
+    def work(dev: dict) -> dict:
+        return _peer_identity(dev["target"], seconds, announce)
+
+    with ThreadPoolExecutor(max_workers=min(4, len(devices))) as pool:
+        for dev, info in zip(devices, pool.map(work, devices)):
+            dev["user_id"] = info.get("user_id")
+            dev["nickname"] = info.get("nickname")
+
+
+def scan_bitchat_peers(seconds: float = 8.0,
+                       identify: bool = True) -> List[dict]:
+    """Find nearby phones that run Bitchat (BLE advertisers).
+
+    With *identify* each phone is briefly connected so the list can show the
+    Bitchat user id (e.g. ``@Alex``) and nickname instead of only a MAC.
+    """
     print(f"Ищу телефоны Bitchat по Bluetooth ({seconds:.0f} c)...")
 
     async def _scan():
@@ -667,8 +755,8 @@ def scan_bitchat_peers(seconds: float = 8.0) -> List[dict]:
                 rssi = getattr(adv, "rssi", None)
                 out.append({"kind": "bitchat", "target": device.address,
                             "name": name or "Bitchat", "rssi": rssi,
-                            "label": f"{name or 'Bitchat'} — {device.address}"
-                                     + (f" ({rssi} dBm)" if rssi else "")})
+                            "user_id": None, "nickname": None,
+                            "label": name or "Bitchat"})
         out.sort(key=lambda d: -(d.get("rssi") or -999))
         return out
 
@@ -677,6 +765,28 @@ def scan_bitchat_peers(seconds: float = 8.0) -> List[dict]:
     except Exception as exc:  # noqa: BLE001
         print(f"Bluetooth недоступен: {exc}")
         return []
+
+    if found and identify:
+        print(f"  уточняю Bitchat ID у {len(found)} устройств...")
+        _identify_peers(found)
+
+    for dev in found:
+        parts = []
+        user_id = dev.get("user_id")
+        nickname = dev.get("nickname")
+        name = dev.get("name")
+        if user_id:
+            parts.append(user_id)
+        known = {(user_id or "").lstrip("@").lower()}
+        if nickname and nickname.lower() not in known:
+            parts.append(f"«{nickname}»")
+            known.add(nickname.lower())
+        if name and name != "Bitchat" and name.lower() not in known:
+            parts.append(name)
+        parts.append(dev["target"])
+        if dev.get("rssi"):
+            parts.append(f"{dev['rssi']} dBm")
+        dev["label"] = " — ".join(parts)
 
     if not found:
         print("Телефоны Bitchat рядом не найдены.")
@@ -1512,7 +1622,9 @@ class BitchatBLEHandler:
         say(f"[Bitchat] {name}: {body_text} "
             f"(в буфере {len(self.history_bitchat)}, ждёт ручной синхронизации)")
 
-    def _handle_announce(self, sender: bytes, payload: bytes, short_id: str) -> None:
+    @staticmethod
+    def _parse_announce_nickname(payload: bytes) -> Optional[str]:
+        """Extract the nickname tag (0x01) from an announce payload."""
         try:
             offset = 0
             while offset + 2 <= len(payload):
@@ -1520,18 +1632,23 @@ class BitchatBLEHandler:
                 length = payload[offset + 1]
                 offset += 2
                 if offset + length > len(payload):
-                    break
+                    return None
                 value = payload[offset:offset + length]
                 offset += length
                 if tag == 0x01:
-                    nickname = value.decode("utf-8", errors="ignore")
-                    key = sender.hex()
-                    if self.peer_nicknames.get(key) != nickname:
-                        self.peer_nicknames[key] = nickname
-                        log.info("Пир %s теперь известен как '%s'", short_id, nickname)
-                    return
-        except Exception as exc:  # noqa: BLE001
-            log.debug("Плохой announce: %s", exc)
+                    return value.decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _handle_announce(self, sender: bytes, payload: bytes, short_id: str) -> None:
+        nickname = self._parse_announce_nickname(payload)
+        if nickname is None:
+            return
+        key = sender.hex()
+        if self.peer_nicknames.get(key) != nickname:
+            self.peer_nicknames[key] = nickname
+            log.info("Пир %s теперь известен как '%s'", short_id, nickname)
 
     def _handle_fragment(self, sender: bytes, payload: bytes, flags: int) -> None:
         if len(payload) < 13:
