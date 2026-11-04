@@ -63,6 +63,12 @@ APP_NAME = "mesh-bitchat-bridge"
 BITCHAT_SERVICE_UUID = "f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c"  # mainnet
 BITCHAT_CHAR_UUID = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
 
+# --- Bitchat link upkeep ---
+# Bitchat and the Windows BLE stack drop idle links, so the bridge keeps the
+# link warm and rebuilds it when the phone goes quiet.
+KEEPALIVE_SECONDS = 25.0     # send a short announce this often
+LINK_TIMEOUT = 90.0          # rebuild the link after this much silence
+
 # --- Meshtastic BLE service ---
 MESHTASTIC_BLE_SERVICE = "6ba1b218-15a8-461f-9fa8-5dcae273eafd"
 MESHTASTIC_TCP_PORT = 4403
@@ -111,6 +117,7 @@ DEFAULT_CONFIG = {
     "chat": {"kind": "channel", "index": 0},
     "ble_scan_seconds": 3.0,
     "bitchat_target": "",
+    "bitchat_peer": "",
     "full_sync": False,
     "history_limit": 100,
     "lora_send_interval": 10.0,
@@ -145,6 +152,7 @@ def save_config(path: str, cfg: dict) -> None:
     data.update({k: v for k, v in cfg.items() if k in DEFAULT_CONFIG})
     data["transport"] = cfg.get("transport", {})
     data["bitchat_target"] = cfg.get("bitchat_target", "")
+    data["bitchat_peer"] = cfg.get("bitchat_peer", "")
     data["full_sync"] = bool(cfg.get("full_sync", False))
     data["chat"] = cfg.get("chat", DEFAULT_CONFIG["chat"])
     try:
@@ -659,142 +667,271 @@ def _probe_announce_packet() -> bytes:
     return probe.build_announce()
 
 
-def _peer_identity(address: str, seconds: float = 5.0,
-                   announce: Optional[bytes] = None) -> dict:
-    """Briefly connect to one Bitchat phone to learn its user id and nickname.
+def _bitchat_characteristics(client) -> list:
+    """Return the Bitchat characteristic objects exposed by a phone.
 
-    The Bitchat user id (e.g. ``@Alex``) lives in the announce packet, so
-    it cannot be read from the advertisement — only from the GATT connection.
-    The bridge sends its own announce, waits for the peer's announce, and
-    disconnects again; no messages are forwarded during this probe.
+    Bitchat on iOS publishes the same service twice. Looking the
+    characteristic up by UUID then fails with "Multiple Characteristics with
+    this UUID", so callers must pass one of these objects to bleak instead.
     """
-    if announce is None:
-        with contextlib.suppress(Exception):
-            announce = _probe_announce_packet()
+    out = []
+    for service in client.services:
+        if str(getattr(service, "uuid", "")).lower() != BITCHAT_SERVICE_UUID:
+            continue
+        for char in getattr(service, "characteristics", []) or []:
+            if str(getattr(char, "uuid", "")).lower() == BITCHAT_CHAR_UUID:
+                out.append(char)
+    return out
+
+
+def _identify_one(address: str, announce: bytes, seconds: float = 3.5) -> dict:
+    """Connect briefly and read this phone's announce (peer id + nickname).
+
+    Returns ``{"peer": hex, "nickname": str, "char": characteristic}`` where
+    *peer* is the 8-byte Bitchat sender id (``@Alex`` is its fallback
+    display name) or ``None`` when the phone did not answer.
+
+    Bitchat sends its announce 0.4 s after a central subscribes, so the wait
+    can stay short; stale addresses fail on connect instead of on the wait.
+    """
+    result = {"peer": None, "nickname": None, "char": None,
+              "variants": 0, "error": None}
 
     async def _probe():
-        client = BleakClient(address, timeout=8.0)
-        result = {"user_id": None, "nickname": None}
+        notes: list = []
+        # Windows BLE connect to a real phone takes 3-11 s, so the connect
+        # timeout has to stay generous; the post-connect wait is short
+        # because Bitchat announces ~0.4 s after we subscribe.
+        client = BleakClient(address, timeout=12.0)
         try:
             await client.connect()
-            try:
-                await client.start_notify(
-                    BITCHAT_CHAR_UUID,
-                    lambda _c, data: _parse_peer(data, result))
-            except Exception:  # noqa: BLE001
-                pass
-
-            if announce:
+            chars = _bitchat_characteristics(client)
+            result["variants"] = len(chars)
+            # The second instance is the one that actually accepts
+            # notifications on current Bitchat builds; try it first.
+            for char in sorted(chars, key=lambda c: -getattr(c, "handle", 0)):
+                notes.clear()
                 try:
-                    await client.write_gatt_char(BITCHAT_CHAR_UUID, announce,
-                                                 response=True)
+                    await client.start_notify(
+                        char, lambda _c, data: notes.append(bytes(data)))
+                except Exception as exc:  # noqa: BLE001
+                    result["error"] = f"{getattr(char, 'handle', '?')}: {exc}"
+                    continue
+
+                result["char"] = char
+                try:
+                    await client.write_gatt_char(char, announce,
+                                                 response=False)
                 except Exception:  # noqa: BLE001
                     with contextlib.suppress(Exception):
-                        await client.write_gatt_char(BITCHAT_CHAR_UUID,
-                                                     announce, response=False)
+                        await client.write_gatt_char(char, announce,
+                                                     response=True)
 
-            deadline = time.time() + seconds
-            while time.time() < deadline and result["user_id"] is None:
-                await asyncio.sleep(0.1)
+                deadline = time.time() + seconds
+                while time.time() < deadline and not notes:
+                    if not client.is_connected:
+                        break
+                    await asyncio.sleep(0.1)
+                if notes:
+                    break
+
+            for raw in notes:
+                parsed = BitchatBLEHandler._parse_packet(raw)
+                if not parsed:
+                    continue
+                sender, packet_type, _ts, _flags, payload = parsed
+                if packet_type != TYPE_ANNOUNCE:
+                    continue
+                result["peer"] = sender.hex()
+                result["nickname"] = \
+                    BitchatBLEHandler._parse_announce_nickname(payload)
+                break
         finally:
             with contextlib.suppress(Exception):
                 await client.disconnect()
         return result
 
-    def _parse_peer(data: bytearray, result: dict) -> None:
-        parsed = BitchatBLEHandler._parse_packet(bytes(data))
-        if not parsed:
-            return
-        sender, packet_type, _ts, _flags, payload = parsed
-        if packet_type != TYPE_ANNOUNCE:
-            return
-        result["user_id"] = "@" + sender.hex()[-4:]
-        nickname = BitchatBLEHandler._parse_announce_nickname(payload)
-        if nickname:
-            result["nickname"] = nickname
-
     try:
         return asyncio.run(_probe())
-    except Exception:  # noqa: BLE001
-        return {"user_id": None, "nickname": None}
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = repr(exc)
+        return result
 
 
-def _identify_peers(devices: List[dict], seconds: float = 5.0) -> None:
-    """Fill user_id/nickname for all found phones, in parallel."""
+def _identify_peers(devices: List[dict], seconds: float = 3.5) -> List[dict]:
+    """Turn raw advertisers into identified phones, one live peer each.
+
+    iOS rotates its Bluetooth address, so Windows keeps stale entries that
+    still point at the same phone. Those never answer, so a device counts as
+    a Bitchat phone only when it returns an announce. Probes run in parallel
+    (each stale address fails on its own) and results are merged by the
+    announced peer id, which is stable across address rotation.
+    """
     if not devices:
-        return
-    announce = None
+        return []
+
+    announce = b""
     with contextlib.suppress(Exception):
         announce = _probe_announce_packet()
 
+    # -- probe every advertised address -----------------------------------
     def work(dev: dict) -> dict:
-        return _peer_identity(dev["target"], seconds, announce)
+        return _identify_one(dev["target"], announce, seconds)
 
     with ThreadPoolExecutor(max_workers=min(4, len(devices))) as pool:
-        for dev, info in zip(devices, pool.map(work, devices)):
-            dev["user_id"] = info.get("user_id")
-            dev["nickname"] = info.get("nickname")
+        infos = list(pool.map(work, devices))
+
+    # Bitchat rate-limits announces per subscribed central, so a live phone
+    # occasionally stays silent on the first try. Retry the silent ones once
+    # before dropping them.
+    retry = [i for i, info in enumerate(infos) if not info.get("peer")]
+    if retry:
+        log.debug("Повторная проверка %d адрес(ов)", len(retry))
+        with ThreadPoolExecutor(max_workers=min(4, len(retry))) as pool:
+            for i, info in zip(retry, pool.map(
+                    lambda i: _identify_one(devices[i]["target"], announce,
+                                            seconds), retry)):
+                if info.get("peer"):
+                    infos[i] = info
+
+    # -- merge answers by peer id, drop everything that did not answer -----
+    phones: List[dict] = []
+    by_peer: dict = {}
+    for dev, info in zip(devices, infos):
+        peer = info.get("peer")
+        if not peer:
+            log.debug("Адрес %s не ответил как Bitchat (%s)",
+                      dev["target"], info.get("error"))
+            continue
+        known = by_peer.get(peer)
+        if known is not None:
+            # Same phone reached through another (older) address.
+            if dev["target"] not in known["addresses"]:
+                known["addresses"].append(dev["target"])
+            known["rssi"] = max(known.get("rssi") or -999,
+                                dev.get("rssi") or -999)
+            continue
+        phone = {
+            "kind": "bitchat",
+            "target": dev["target"],
+            "addresses": [dev["target"]],
+            "name": dev.get("name") or "Bitchat",
+            "rssi": dev.get("rssi"),
+            "peer": peer,
+            "user_id": "@" + peer[:4],
+            "nickname": info.get("nickname"),
+            "char": info.get("char"),
+            "label": dev.get("label") or "Bitchat",
+        }
+        by_peer[peer] = phone
+        phones.append(phone)
+
+    phones.sort(key=lambda d: -(d.get("rssi") or -999))
+    return phones
+
+
+def _best_characteristic(client):
+    """Pick the Bitchat characteristic to notify/write on.
+
+    Current Bitchat builds publish the same service twice, so ``bleak``
+    refuses to resolve the characteristic by UUID ("Multiple
+    Characteristics with this UUID"). The higher handle is the instance
+    that actually delivers notifications, so prefer it.
+    """
+    chars = _bitchat_characteristics(client)
+    if not chars:
+        return None
+    return max(chars, key=lambda c: getattr(c, "handle", 0))
 
 
 def scan_bitchat_peers(seconds: float = 8.0,
                        identify: bool = True) -> List[dict]:
-    """Find nearby phones that run Bitchat (BLE advertisers).
+    """Find phones that really run Bitchat.
 
-    With *identify* each phone is briefly connected so the list can show the
-    Bitchat user id (e.g. ``@Alex``) and nickname instead of only a MAC.
+    Two stages:
+
+    1. BLE scan — keep advertisers that expose the Bitchat service.
+    2. Identify — connect to each candidate and wait for its announce, which
+       is the only proof that the device is a Bitchat phone. Windows keeps
+       stale entries for addresses iOS has already rotated away, and those
+       never answer; showing them would let the user pick a dead address.
+
+    *identify* is only disabled by tests, where BLE is not available.
     """
     print(f"Ищу телефоны Bitchat по Bluetooth ({seconds:.0f} c)...")
 
+    # -- stage 1: BLE scan of raw advertisers -----------------------------
     async def _scan():
         devs = await BleakScanner.discover(timeout=seconds, return_adv=True)
         out = []
         for device, adv in devs.values():
             uuids = {str(u).lower() for u in (adv.service_uuids or [])}
             name = (adv.local_name or getattr(device, "name", "") or "")
-            if BITCHAT_SERVICE_UUID in uuids or "bitchat" in name.lower():
-                rssi = getattr(adv, "rssi", None)
+            service_data = (adv.service_data or {}).get(BITCHAT_SERVICE_UUID)
+            # Bitchat hides its name and only advertises the service, so the
+            # UUID (or service data) is the reliable marker.
+            if BITCHAT_SERVICE_UUID in uuids or service_data:
                 out.append({"kind": "bitchat", "target": device.address,
-                            "name": name or "Bitchat", "rssi": rssi,
+                            "name": name or "Bitchat",
+                            "rssi": getattr(adv, "rssi", None),
+                            "service_data": service_data.hex()
+                                            if service_data else None,
                             "user_id": None, "nickname": None,
                             "label": name or "Bitchat"})
         out.sort(key=lambda d: -(d.get("rssi") or -999))
         return out
 
     try:
-        found = asyncio.run(_scan())
+        candidates = asyncio.run(_scan())
     except Exception as exc:  # noqa: BLE001
         print(f"Bluetooth недоступен: {exc}")
         return []
 
-    if found and identify:
-        print(f"  уточняю Bitchat ID у {len(found)} устройств...")
-        _identify_peers(found)
+    if not candidates:
+        print("Телефоны Bitchat рядом не найдены.")
+        return []
 
+    # -- stage 2: keep only devices that prove they are Bitchat -------------
+    if identify:
+        print(f"  найдено {len(candidates)} адрес(ов), проверяю Bitchat у каждого...")
+        found = _identify_peers(candidates)
+        lost = len(candidates) - len(found)
+        if lost:
+            log.debug("Отброшено %d адрес(ов) без ответа Bitchat", lost)
+    else:
+        found = candidates
+
+    # -- stage 3: human-readable label --------------------------------------
     for dev in found:
         parts = []
         user_id = dev.get("user_id")
         nickname = dev.get("nickname")
-        name = dev.get("name")
+        alias = dev.get("name")
         if user_id:
             parts.append(user_id)
         known = {(user_id or "").lstrip("@").lower()}
         if nickname and nickname.lower() not in known:
             parts.append(f"«{nickname}»")
             known.add(nickname.lower())
-        if name and name != "Bitchat" and name.lower() not in known:
-            parts.append(name)
+        if alias and alias != "Bitchat" and alias.lower() not in known:
+            parts.append(alias)
         parts.append(dev["target"])
         if dev.get("rssi"):
             parts.append(f"{dev['rssi']} dBm")
         dev["label"] = " — ".join(parts)
 
     if not found:
-        print("Телефоны Bitchat рядом не найдены.")
+        print("Bitchat-телефоны не ответили "
+              "(приложение должно быть открыто и на экране).")
     return found
 
 
 def choose_bitchat_peer(seconds: float = 8.0) -> Optional[dict]:
-    """Let the user pick which Bitchat phone this bridge talks to."""
+    """Let the user pick which Bitchat phone this bridge talks to.
+
+    Returns the chosen phone dict (see ``_identify_peers``) or ``None`` when
+    the user prefers to connect to any Bitchat phone found later.
+    """
     devices = scan_bitchat_peers(seconds)
     if not devices:
         print("Мост будет подключаться к любому найденному Bitchat-устройству.")
@@ -1414,14 +1551,34 @@ class BitchatBLEHandler:
     def __init__(self, loop: asyncio.AbstractEventLoop, nickname: str,
                  scan_seconds: float = 3.0, history_limit: int = 100,
                  target_address: Optional[str] = None,
-                 full_sync: bool = False) -> None:
+                 full_sync: bool = False,
+                 target_peer: Optional[str] = None) -> None:
         self.loop = loop
         self.nickname = nickname
         self.scan_seconds = scan_seconds
         self.history_limit = max(1, int(history_limit))
         # When set, only this BLE address may be bridged (other people's
-        # phones nearby must never receive our traffic).
+        # phones nearby must never receive our traffic). iOS rotates its
+        # Bluetooth address, so a list of known addresses is accepted.
         self.target_address = (target_address or "").strip() or None
+        self.target_addresses = {
+            a.strip().lower()
+            for a in (self.target_address or "").split(",")
+            if a.strip()
+        }
+        # Bitchat characteristic object per connected address (see _write_raw).
+        self._chars: Dict[str, object] = {}
+        # Peer id last seen from each connected address, so the bridge can
+        # recognise its own phone even after the address rotated.
+        self.peer_ids: Dict[str, str] = {}
+        # Timestamp of the last packet received from each address, and of the
+        # last keepalive sent. Used by the watchdog to detect a dead link.
+        self._last_seen: Dict[str, float] = {}
+        self._last_keepalive: float = 0.0
+        # Stable Bitchat identity of the chosen phone (8 bytes as hex). iOS
+        # rotates the Bluetooth address but never the Bitchat peer id, so
+        # this is what the bridge actually verifies.
+        self.target_peer = (target_peer or "").strip().lower() or None
         # Full two-way sync: forward every incoming message to the other side
         # immediately, in addition to the normal one-way behaviour.
         self.full_sync = bool(full_sync)
@@ -1702,6 +1859,13 @@ class BitchatBLEHandler:
             if not parsed:
                 return
             sender, packet_type, timestamp, flags, payload = parsed
+            # Any packet proves the link is alive (watchdog input).
+            addr = getattr(client, "address", "")
+            self._last_seen[addr] = time.time()
+            # Remember which Bitchat identity sits behind this address: the
+            # address rotates, the identity does not.
+            if packet_type == TYPE_ANNOUNCE:
+                self.peer_ids[addr] = sender.hex()
             if packet_type == TYPE_FRAGMENT:
                 self._handle_fragment(sender, payload, flags)
             else:
@@ -1738,23 +1902,66 @@ class BitchatBLEHandler:
                 client, self.build_packet(TYPE_FRAGMENT, frag, recipient=BROADCAST_ID)
             )
 
+    async def _wait_for_peer(self, client: BleakClient,
+                             seconds: float = 4.0) -> Optional[str]:
+        """Wait until this phone sends its announce; return its peer id.
+
+        The announce is the only proof of identity, so it is also what keeps
+        the bridge from latching onto a stranger's phone after the real one
+        rotated its Bluetooth address.
+        """
+        await self._write_raw(client, self.build_announce())
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            peer = self.peer_ids.get(getattr(client, "address", ""))
+            if peer:
+                return peer
+            if not client.is_connected:
+                return None
+            await asyncio.sleep(0.1)
+        return None
+
     async def _write_raw(self, client: BleakClient, packet: bytes) -> None:
+        """Write one packet to the phone.
+
+        The characteristic object is stored per client, because Bitchat
+        publishes its service twice and resolving by UUID raises
+        "Multiple Characteristics with this UUID".
+        """
+        char = self._chars.get(getattr(client, "address", ""))
+        if char is None:
+            char = _best_characteristic(client)
+            if char is None:
+                raise BleakError("у телефона нет Bitchat-характеристики")
+            self._chars[getattr(client, "address", "")] = char
         try:
-            await client.write_gatt_char(BITCHAT_CHAR_UUID, packet, response=True)
+            await client.write_gatt_char(char, packet, response=True)
         except Exception:
-            await client.write_gatt_char(BITCHAT_CHAR_UUID, packet, response=False)
+            await client.write_gatt_char(char, packet, response=False)
 
     def _disconnected(self, client: BleakClient) -> None:
+        """Forget a phone that went away so the scanner can re-find it."""
         addr = getattr(client, "address", "?")
         log.info("Пир Bitchat отключился: %s", addr)
         say("[Bitchat] телефон отключился")
+        self._chars.pop(addr, None)
         self.connected.pop(addr, None)
+        self._last_seen.pop(addr, None)
         self.connecting.discard(addr)
+        # Never blacklist the phone we are bound to: the next scan should be
+        # able to reconnect right away (a drop is normal on iOS).
+        self.failed.pop(addr, None)
         truncate_logs()
 
     async def connect(self, device) -> None:
+        """Connect to one Bitchat phone and start bridging."""
         addr = device.address
-        if self.target_address and addr.lower() != self.target_address.lower():
+        # When the user picked a phone, only that phone may be bridged. Its
+        # Bluetooth address rotates, so a saved peer id is verified after
+        # connecting instead of matching on the address.
+        if self.target_peer:
+            pass
+        elif self.target_address and addr.lower() not in self.target_addresses:
             return
         if addr in self.connected or addr in self.connecting:
             return
@@ -1764,8 +1971,22 @@ class BitchatBLEHandler:
         client = BleakClient(addr, timeout=15.0, disconnected_callback=self._disconnected)
         try:
             await client.connect()
-            await client.start_notify(BITCHAT_CHAR_UUID,
-                                      lambda c, d: self._notification(client, c, d))
+            # Bitchat exposes two identical services; pick the object once.
+            char = _best_characteristic(client)
+            if char is None:
+                raise BleakError("устройство не предоставляет Bitchat-сервис")
+            await client.start_notify(
+                char, lambda c, d: self._notification(client, c, d))
+            self._chars[addr] = char
+            # A saved peer id is the strongest guard: iOS rotates the
+            # Bluetooth address, but the Bitchat identity stays the same.
+            if self.target_peer:
+                peer = await self._wait_for_peer(client, seconds=4.0)
+                if peer and peer != self.target_peer:
+                    raise BleakError(
+                        f"это другой телефон Bitchat (@{peer[:4]})")
+                if not peer:
+                    log.debug("Пир %s не прислал announce за 4 c", addr)
             self.connected[addr] = client
             await self._write_raw(client, self.build_announce())
             log.info("Пир Bitchat подключён: %s", getattr(device, "name", None) or addr)
@@ -1773,6 +1994,7 @@ class BitchatBLEHandler:
             await self.flush_undelivered(client)
         except Exception as exc:  # noqa: BLE001
             log.debug("BLE-подключение к %s не удалось: %s", addr, exc)
+            self._chars.pop(addr, None)
             self.failed[addr] = time.time()
             try:
                 await client.disconnect()
@@ -1783,13 +2005,21 @@ class BitchatBLEHandler:
 
     @staticmethod
     def _is_bitchat(device, adv) -> bool:
+        """True when this advertisement belongs to a Bitchat phone.
+
+        Bitchat hides its name, so the service UUID (or its service data,
+        which carries the 8-byte peer id) is the marker.
+        """
         uuids = {str(u).lower() for u in (adv.service_uuids or [])}
         if BITCHAT_SERVICE_UUID in uuids:
+            return True
+        if (adv.service_data or {}).get(BITCHAT_SERVICE_UUID):
             return True
         name = (adv.local_name or getattr(device, "name", "") or "").lower()
         return "bitchat" in name
 
     async def scanner(self) -> None:
+        """Keep scanning for the chosen Bitchat phone and connect when seen."""
         log.info("Ищу Bitchat-пиры по Bluetooth...")
         while not self._stopping:
             try:
@@ -1797,10 +2027,12 @@ class BitchatBLEHandler:
                                                       return_adv=True)
                 self._bluetooth_warned = False
                 for device, adv in devices.values():
-                    if self._is_bitchat(device, adv):
-                        if (device.address not in self.connected
-                                and device.address not in self.connecting):
-                            asyncio.create_task(self.connect(device))
+                    if not self._is_bitchat(device, adv):
+                        continue
+                    if (device.address in self.connected
+                            or device.address in self.connecting):
+                        continue
+                    asyncio.create_task(self.connect(device))
             except BleakError as exc:
                 if not self._bluetooth_warned:
                     log.error("Проблема с Bluetooth: %s", exc)
@@ -1934,13 +2166,69 @@ class BitchatBLEHandler:
                     log.debug("Повторный announce для %s не удался: %s", addr, exc)
 
     async def maintenance_loop(self) -> None:
-        """Retry a partially delivered history even without a new event."""
+        """Keep the phone link alive and retry pending deliveries.
+
+        Two jobs:
+
+        * watchdog — Bitchat (and the Windows BLE stack) drop an idle link
+          after a while; a phone that changed address shows up under a new
+          address. A link that stops answering for ``LINK_TIMEOUT`` seconds is
+          closed and re-established instead of silently going dead.
+        * delivery — retry a partially sent history without waiting for a new
+          event.
+        """
         while not self._stopping:
             await asyncio.sleep(20)
+            await self._watchdog()
             if self.connected and self.meshtastic:
                 if any(not e.get("delivered")
                        for e in list(self.meshtastic.history_lora)):
                     await self.flush_undelivered()
+
+    async def _watchdog(self) -> None:
+        """Drop dead links and keep the live ones warm."""
+        now = time.time()
+        for addr, client in list(self.connected.items()):
+            alive = True
+            try:
+                alive = bool(client.is_connected)
+            except Exception:  # noqa: BLE001
+                alive = False
+
+            # A link that stopped answering for too long is dead even if the
+            # stack still reports it as connected.
+            last = self._last_seen.get(addr, 0.0)
+            if alive and last and now - last > LINK_TIMEOUT:
+                log.info("Пир %s молчит %.0f c — переподключаюсь",
+                         addr, now - last)
+                alive = False
+
+            if not alive:
+                self._drop_link(addr, force=True)
+                continue
+
+            # Keepalive: a tiny announce refreshes Bitchat's idle timer.
+            if now - self._last_keepalive >= KEEPALIVE_SECONDS:
+                try:
+                    await self._write(client, self.build_announce())
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("Keepalive для %s не удался: %s", addr, exc)
+                    self._drop_link(addr, force=True)
+        self._last_keepalive = now
+
+    def _drop_link(self, addr: str, force: bool = False) -> None:
+        """Forget a link so the scanner can reconnect to this phone."""
+        client = self.connected.pop(addr, None)
+        self._chars.pop(addr, None)
+        self._last_seen.pop(addr, None)
+        self.connecting.discard(addr)
+        if force:
+            # Do not blacklist a phone we want back: clear any cooldown so the
+            # next scan may reconnect immediately.
+            self.failed.pop(addr, None)
+        if client is not None:
+            with contextlib.suppress(Exception):
+                asyncio.get_running_loop().create_task(client.disconnect())
 
     async def stop(self) -> None:
         self._stopping = True
@@ -2480,12 +2768,14 @@ async def run(transport: Optional[dict], name: str, scan_seconds: float,
               lora_stale_seconds: float = 1800.0,
               console: bool = False,
               bitchat_target: Optional[str] = None,
-              full_sync: bool = False) -> int:
+              full_sync: bool = False,
+              bitchat_peer: Optional[str] = None) -> int:
     loop = asyncio.get_running_loop()
 
     ble = BitchatBLEHandler(loop, name, scan_seconds, history_limit,
                             target_address=bitchat_target,
-                            full_sync=full_sync)
+                            full_sync=full_sync,
+                            target_peer=bitchat_peer)
     mesh = MeshtasticHandler(loop, transport, default_channel=channel,
                              lora_send_interval=lora_send_interval,
                              history_limit=history_limit,
@@ -2602,6 +2892,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     lora_stale_seconds = max(0.0, float(cfg.get("lora_stale_seconds", 1800) or 0))
 
     bitchat_target = (args.bitchat or cfg.get("bitchat_target") or "").strip() or None
+    bitchat_peer = (cfg.get("bitchat_peer") or "").strip().lower() or None
     full_sync = bool(cfg.get("full_sync", False))
     if args.full_sync:
         full_sync = True
@@ -2654,15 +2945,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"\nВыбрано: {transport['label']}\n")
             peer = choose_bitchat_peer(scan_seconds * 2)
             if peer:
-                bitchat_target = peer["target"]
+                # Remember the addresses and the stable Bitchat identity:
+                # iOS rotates the Bluetooth address between runs.
+                addresses = peer.get("addresses") or [peer["target"]]
+                bitchat_target = ",".join(addresses)
+                bitchat_peer = peer.get("peer")
                 print(f"Устройство Bitchat: {peer['label']}\n")
             else:
                 bitchat_target = None
+                bitchat_peer = None
                 print("Bitchat-устройство не выбрано — мост подключится к любому.\n")
             # Remember the choice so the next start can skip the menu.
             cfg["transport"] = {k: v for k, v in transport.items()
                                 if k in ("kind", "target", "port")}
             cfg["bitchat_target"] = bitchat_target or ""
+            cfg["bitchat_peer"] = bitchat_peer or ""
             save_config(args.config, cfg)
         else:
             transport = cli_transport or transport_from_config(cfg)
@@ -2673,7 +2970,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                             lora_send_interval, lora_stale_seconds,
                             console=console_enabled,
                             bitchat_target=bitchat_target,
-                            full_sync=full_sync))
+                            full_sync=full_sync,
+                            bitchat_peer=bitchat_peer))
         except KeyboardInterrupt:
             print("\nОстановлено.")
             return 0
