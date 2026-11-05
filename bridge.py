@@ -688,8 +688,8 @@ def _identify_one(address: str, announce: bytes, seconds: float = 3.5) -> dict:
     """Connect briefly and read this phone's announce (peer id + nickname).
 
     Returns ``{"peer": hex, "nickname": str, "char": characteristic}`` where
-    *peer* is the 8-byte Bitchat sender id (``@Alex`` is its fallback
-    display name) or ``None`` when the phone did not answer.
+    *peer* is the 8-byte Bitchat sender id, and the app's fallback display
+    name for a stranger is ``anon<first 4 hex>``.
 
     Bitchat sends its announce 0.4 s after a central subscribes, so the wait
     can stay short; stale addresses fail on connect instead of on the wait.
