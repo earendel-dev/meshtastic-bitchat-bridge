@@ -1737,7 +1737,9 @@ class MeshtasticHandler:
             where = "личное" if is_dm else f"канал {channel_index}"
             log.info("(LoRa -> BLE) от %s, %s: %d символов",
                      sender, where, len(text))
-            say(f"[LoRa] {sender}: {text}")
+            # The text itself never reaches the console: only the fact that
+            # something arrived.
+            say(f"[LoRa] {sender}: сообщение ({len(text)} симв.)")
             body = f"{prefix} {text}"
             entry = {
                 "ts": time.time(),
@@ -2001,7 +2003,8 @@ class BitchatBLEHandler:
         self._bluetooth_warned = False
         # Last N Bitchat messages, kept for the manual "send last 5/10/20/50"
         # sync.  They are never sent to LoRa automatically.  The text itself
-        # is only held sealed; entries carry a digest and a short preview.
+        # is only held sealed inside the entry; nothing readable is kept
+        # beside it, not even a preview.
         self.history_bitchat: deque = deque(maxlen=self.history_limit)
         # Recently delivered LoRa -> Bitchat bodies, used to filter echoes
         # (digests only, never the text).
@@ -2203,15 +2206,13 @@ class BitchatBLEHandler:
             else:
                 body_text = stripped
 
-        preview = body_text[:40]
-        # The console keeps a single line per message; anything longer is cut.
-        if len(preview) > 24:
-            preview = preview[:24] + "…"
+        # No text is kept outside the sealed body: not even a short preview
+        # for the console or the buffer list.
         entry = {
             "ts": time.time(),
             "name": name,
             "sealed": seal_text(body_text),
-            "preview": preview,
+            "preview": "",
             "channel": max(0, min(7, int(channel))),
             "destination": destination,
             "sent_lora": False,
@@ -2223,10 +2224,12 @@ class BitchatBLEHandler:
             # Full two-way mode: forward at once, still via the rate-limited
             # LoRa queue so the air is not flooded.
             self.meshtastic.send_history_entry(entry)
-            say(f"[Bitchat] {name}: {preview} (в очереди на LoRa)")
+            say(f"[Bitchat] {name}: сообщение ({len(body_text)} симв.) "
+                "в очереди на LoRa")
             return
-        say(f"[Bitchat] {name}: {preview} "
-            f"(в буфере {len(self.history_bitchat)}, ждёт ручной синхронизации)")
+        say(f"[Bitchat] {name}: сообщение ({len(body_text)} симв.) "
+            f"(в буфере {len(self.history_bitchat)}, "
+            "ждёт ручной синхронизации)")
 
     @staticmethod
     def _parse_announce_nickname(payload: bytes) -> Optional[str]:
