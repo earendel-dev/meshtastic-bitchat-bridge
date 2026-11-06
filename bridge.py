@@ -2231,6 +2231,8 @@ class BitchatBLEHandler:
         #   "bound"  — only the bound phone (strict, default);
         #   "custom" — the bound phone plus peer ids listed in
         #              ``bitchat_sources`` (every key proven by an announce);
+        #   "replies" — the bound phone plus phones it answered in the public
+        #              chat (learned live, see ``_note_public_traffic``);
         #   "all"    — any sender that arrives on the phone link, including
         #              fragments with no verifiable signature (a fragment
         #              carries only a sender id, so authorship cannot be
@@ -2239,6 +2241,19 @@ class BitchatBLEHandler:
         # cannot silently widen what leaves the radio.
         self.forward_mode: str = "bound"
         self.bitchat_sources: set = set()
+        # Phones the owner has *answered* in the public chat ("replies" mode).
+        # In that mode a message from someone reaches LoRa only after the bound
+        # phone has posted after them in the same public chat, which is what an
+        # owner answering a stranger looks like on the wire.  Keyed exactly
+        # like ``bitchat_sources``.  Never stored in the config file.
+        self.bitchat_replied: set = set()
+        # Peer id whose message was the last one seen in the public chat, and
+        # the number of that message.  When the bound phone posts after it,
+        # that peer is marked as answered.  Only ids and a counter are kept,
+        # never the text.
+        self._last_public_sender: Optional[str] = None
+        self._public_counter: int = 0
+        self._last_public_seq: int = 0
         # Address of the link the current chain of fragments arrived on; it
         # picks the right per-link fragment table in _handle_fragment.
         self._fragment_addr: Optional[str] = None
@@ -2401,7 +2416,37 @@ class BitchatBLEHandler:
 
         if packet_type == TYPE_MESSAGE:
             name = self._display_name(sender, source_addr)
+            self._note_public_traffic(sender.hex(), source_addr)
             self._on_bitchat_text(text, name, sender.hex())
+
+    def _note_public_traffic(self, peer: str, source_addr: Optional[str]) -> None:
+        """Track who spoke last in the public chat, to learn who was answered.
+
+        The bridge never reads the text to decide this.  It only remembers the
+        id of the last public sender; when the bound phone posts afterwards,
+        that sender counts as answered and is added to ``bitchat_replied``.
+        An owner replying to a stranger in #mesh is exactly this pattern, and
+        it is the only signal the wire offers, because a public message has no
+        addressee.
+        """
+        if not self.bound_peer:
+            return
+        self._public_counter += 1
+        from_bound = peer == self.bound_peer or (
+            bool(source_addr) and self.peer_ids.get(source_addr) == self.bound_peer)
+        if from_bound:
+            # The bound phone spoke: whoever it was answering is now a source.
+            if self._last_public_sender and \
+                    self._last_public_sender != self.bound_peer:
+                if self._last_public_sender not in self.bitchat_replied:
+                    self.bitchat_replied.add(self._last_public_sender)
+                    log.info("Пир %s отмечен как ответивший (режим «ответившие» "
+                             "теперь %d)", self._last_public_sender[-4:],
+                             len(self.bitchat_replied))
+            self._last_public_sender = None
+            return
+        self._last_public_sender = peer
+        self._last_public_seq = self._public_counter
 
     def _packet_allowed(self, sender: bytes, raw: Optional[bytes],
                         source_addr: Optional[str] = None) -> bool:
@@ -2412,6 +2457,10 @@ class BitchatBLEHandler:
         * ``bound`` — exactly the bound phone, signature verified;
         * ``custom`` — the bound phone or one of ``bitchat_sources``, each
           proven by its own self-signed announce;
+        * ``replies`` — the bound phone and the phones it has answered in the
+          public chat (``bitchat_replied``).  A stranger's message starts
+          reaching LoRa only after the owner posts after it in #mesh; nothing
+          is forwarded from people the owner never answered;
         * ``all`` — the bound phone, any chosen phone, and any sender whose key
           is not known yet.  Once a peer's key is known (from its verified
           announce) this mode *requires* a valid signature from it: a frame
@@ -2449,6 +2498,8 @@ class BitchatBLEHandler:
         allowed = is_bound or from_bound_link
         if not allowed and self.forward_mode == "custom":
             allowed = peer in self.bitchat_sources
+        if not allowed and self.forward_mode == "replies":
+            allowed = peer in self.bitchat_replied
         if not allowed:
             return False
 
@@ -2456,6 +2507,14 @@ class BitchatBLEHandler:
             # A chosen phone is trusted by the key it proved with its own
             # announce; the packet is still checked when its frame carries a
             # signature (a reassembled fragment carries none).
+            key = self.peer_keys.get(peer)
+            if key is not None and raw is not None:
+                return verify_packet_signature(bytes(raw), key)
+            return True
+
+        if self.forward_mode == "replies" and peer in self.bitchat_replied:
+            # Same trust as a listed phone: the id was learned from verified
+            # traffic; the frame is checked whenever it carries a signature.
             key = self.peer_keys.get(peer)
             if key is not None and raw is not None:
                 return verify_packet_signature(bytes(raw), key)
@@ -2644,15 +2703,19 @@ class BitchatBLEHandler:
             return True
         if self.forward_mode == "custom":
             return peer in self.bitchat_sources
+        if self.forward_mode == "replies":
+            return peer in self.bitchat_replied
         return False
 
     def set_forward_mode(self, mode: str) -> None:
         """Switch the Bitchat → LoRa forwarding mode (console action)."""
-        if mode not in ("bound", "custom", "all"):
+        if mode not in ("bound", "custom", "all", "replies"):
             mode = "bound"
         self.forward_mode = mode
         if mode != "custom":
             self.bitchat_sources.clear()
+        if mode != "replies":
+            self.bitchat_replied.clear()
         log.info("Bitchat -> LoRa: режим %s", mode)
 
     @staticmethod
@@ -3805,6 +3868,15 @@ FORWARD_WARNING_CUSTOM = (
     "телефона, но и тех пиров, которых вы отметите. Их подпись проверяется\n"
     "по ключу из announce, но увидите вы лишь то, что телефон переслал.")
 
+FORWARD_WARNING_REPLIES = (
+    "Режим «те, кому я ответил».\n"
+    "В LoRa уходят сообщения привязанного телефона и тех людей, которым вы\n"
+    "сами написали в общем чате после их сообщения. Пока вы человеку не\n"
+    "ответили, его сообщения в LoRa не идут. Список собирается сам и живёт\n"
+    "до конца работы моста; текст сообщений для этого не читается.\n"
+    "Общий чат не адресован лично вам, поэтому «ответить» мост понимает\n"
+    "только так: ваше сообщение ушло в #mesh после его сообщения.")
+
 FORWARD_HINT = ("(подсказка: список обновляется по мере поступления announce "
                 "от Bitchat-пиров)")
 
@@ -3938,6 +4010,9 @@ def _forward_mode_name(ble: "BitchatBLEHandler") -> str:
     if ble.forward_mode == "custom":
         return (f"привязанный + {len(ble.bitchat_sources)} выбранных "
                 "телефонов")
+    if ble.forward_mode == "replies":
+        return (f"привязанный + {len(ble.bitchat_replied)} телефонов, "
+                "которым вы ответили")
     return "только привязанный телефон"
 
 
@@ -3970,8 +4045,9 @@ def console_forward_menu(ble: "BitchatBLEHandler",
         print("  2) два телефона — привязанный + ещё один")
         print("  3) много телефонов — привязанный + список")
         print("  4) любой телефон — всё, что доходит до моста")
+        print("  5) те, кому я ответил — чужие только после вашего ответа")
         print("  0) назад")
-        choice = _read_choice("Пункт: ", {"1", "2", "3", "4"})
+        choice = _read_choice("Пункт: ", {"1", "2", "3", "4", "5"})
         if choice is None:
             return
 
@@ -4005,6 +4081,22 @@ def console_forward_menu(ble: "BitchatBLEHandler",
                 on_change("custom")
             continue
 
+        # 5) Only people the owner answered: the list is learned live, so this
+        #    mode is available at once and fills up as the owner replies.
+        if choice == "5":
+            print()
+            print(FORWARD_WARNING_REPLIES)
+            if ble.bound_peer:
+                print(f"Сейчас в списке: {len(ble.bitchat_replied)}")
+            if not _confirm_forward("Подтвердите этот выбор."):
+                print("Режим не изменён.")
+                continue
+            ble.set_forward_mode("replies")
+            say("[Bitchat] в LoRa идут сообщения привязанного телефона и тех, "
+                "кому вы ответили в общем чате")
+            if on_change:
+                on_change("replies")
+            continue
         # 4) Any phone: the widest rule, so it asks for the same two "yes".
         if not _confirm_forward(FORWARD_WARNING_ALL):
             print("Режим не изменён.")
@@ -4251,10 +4343,13 @@ def console_loop(ble: "BitchatBLEHandler", mesh: "MeshtasticHandler",
             print(f"  Телефон: {bound}")
             names = {"bound": "только привязанный телефон",
                      "custom": "привязанный + выбранные",
-                     "all": "любой телефон, дошедший до моста"}
+                     "all": "любой телефон, дошедший до моста",
+                     "replies": "привязанный + те, кому я ответил"}
             print(f"  Bitchat → LoRa: {names.get(ble.forward_mode, ble.forward_mode)}"
                   + (f" ({len(ble.bitchat_sources)} выбранных)"
-                     if ble.forward_mode == "custom" else ""))
+                     if ble.forward_mode == "custom" else "")
+                  + (f" ({len(ble.bitchat_replied)} ответивших)"
+                     if ble.forward_mode == "replies" else ""))
             print(f"  Режим: {'полная синхронизация в обе стороны' if ble.full_sync else 'авто только LoRa → Bitchat'}")
             print(f"  {scheduler.describe()}")
             print()
@@ -4275,6 +4370,8 @@ def console_loop(ble: "BitchatBLEHandler", mesh: "MeshtasticHandler",
             ble.target_peer = None
             ble.private_confirmed = False
             ble.bitchat_sources = set()
+            ble.bitchat_replied = set()
+            ble._last_public_sender = None
             ble.set_forward_mode("bound")
             for addr, client in list(ble.connected.items()):
                 ble.connected.pop(addr, None)
@@ -4332,12 +4429,16 @@ async def run(transport: Optional[dict], name: str, scan_seconds: float,
     mesh.set_ble_handler(ble)
     # Which Bitchat senders may reach LoRa.  The mode comes from the user's
     # choice (config file or --bitchat-forward) and decides what the phone
-    # part may forward.  The list of extra phones ("custom") is never stored:
-    # without it, a start falls back to the strict mode, so a restart after a
-    # power blip can never silently widen what leaves the radio.
-    mode = forward_mode if forward_mode in ("bound", "custom", "all") else "bound"
-    if mode == "custom":
+    # part may forward.  Two modes hold a learned or picked list ("custom" and
+    # "replies"), and neither list is ever stored: a start therefore falls
+    # back to the strict mode, so a restart after a power blip can never
+    # silently widen what leaves the radio.
+    if forward_mode not in ("bound", "custom", "all", "replies"):
         mode = "bound"
+    elif forward_mode in ("custom", "replies"):
+        mode = "bound"
+    else:
+        mode = forward_mode
     ble.set_forward_mode(mode)
     await asyncio.to_thread(mesh.start)
 
@@ -4422,11 +4523,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="two-way sync: forward new messages immediately both ways")
     p.add_argument("--no-full-sync", action="store_true",
                    help="disable two-way sync even if config enables it")
-    p.add_argument("--bitchat-forward", choices=("bound", "custom", "all"),
+    p.add_argument("--bitchat-forward",
+                   choices=("bound", "custom", "all", "replies"),
                    metavar="MODE",
                    help="what may be sent from Bitchat to LoRa: 'bound' "
                         "(only the bound phone), 'custom' (list picked in the "
-                        "console), 'all' (everything that reaches the phone)")
+                        "console), 'replies' (phones you answered in the public "
+                        "chat), 'all' (everything that reaches the phone)")
     p.add_argument("--name", help="bridge nickname in Bitchat")
     p.add_argument("--channel", type=int, metavar="N",
                    help="default Meshtastic channel index for Bitchat messages")
@@ -4483,7 +4586,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # extra phones is never written there, because a person who opens the
     # phone instead of the chat must not be able to widen it silently.
     forward_mode = str(cfg.get("bitchat_forward") or "bound").strip().lower()
-    if forward_mode not in ("bound", "custom", "all"):
+    if forward_mode not in ("bound", "custom", "all", "replies"):
         forward_mode = "bound"
     if args.bitchat_forward:
         forward_mode = args.bitchat_forward
