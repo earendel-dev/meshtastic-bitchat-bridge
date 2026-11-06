@@ -10,6 +10,9 @@ config.json
 bridge.log
 *.log
 
+# Private developer notes — local only, must never reach the public repo
+DEVELOPMENT.md
+
 # Editors / OS
 .vscode/
 .idea/

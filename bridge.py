@@ -39,9 +39,11 @@ import re
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import zlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -82,6 +84,30 @@ PACKET_VERSION = 0x01
 TYPE_ANNOUNCE = 0x01
 TYPE_MESSAGE = 0x02
 TYPE_FRAGMENT = 0x20
+
+# Every other type the client defines.  They are dropped before their payload
+# is decoded - several of them (group, noise, voice, file) carry ciphertext or
+# binary data that would never become a LoRa message, so decoding them was
+# pure waste.  Types not listed here are unknown and refused as well.
+OTHER_PACKET_TYPES = frozenset({
+    0x03,  # leave
+    0x04,  # courier envelope
+    0x05,  # request sync
+    0x10,  # noise handshake
+    0x11,  # noise encrypted (private chat)
+    0x12,  # v2 link handshake
+    0x1F,  # reserved, sits right below the fragment type
+    0x21,  # request sync (extended)
+    0x22,  # file transfer
+    0x23,  # board post
+    0x25,  # group message (ChaCha20-Poly1305)
+    0x28,  # Nostr carrier
+    0x29,  # voice
+    0x2A,  # prekey bundle
+    0x2C,  # prekey request
+})
+FORWARDABLE_PACKET_TYPES = frozenset({TYPE_ANNOUNCE, TYPE_MESSAGE,
+                                      TYPE_FRAGMENT})
 
 TTL = 0x07
 FLAG_HAS_RECIPIENT = 0x01
@@ -498,6 +524,14 @@ DEFAULT_CONFIG = {
     # The bound phone is never written here: the binding is confirmed in the
     # console for one session only (see confirm_binding).
     "full_sync": False,
+    # Which Bitchat senders may reach LoRa:
+    #   "bound"  — only the bound phone (default, the strict mode);
+    #   "custom" — the bound phone plus the peers picked in the console ("b");
+    #   "all"    — anything that arrives on the phone link.
+    # Only this MODE is remembered.  The peer ids for "custom" are never
+    # stored: after a restart the bridge starts in "bound" and the list is
+    # picked again, so an edited file cannot widen what leaves the radio.
+    "bitchat_forward": "bound",
     "history_limit": 100,
     "lora_send_interval": 10.0,
     "lora_stale_seconds": 1800,
@@ -532,6 +566,9 @@ def save_config(path: str, cfg: dict) -> None:
     data["transport"] = cfg.get("transport", {})
     data["bitchat_target"] = cfg.get("bitchat_target", "")
     data["full_sync"] = bool(cfg.get("full_sync", False))
+    mode = str(cfg.get("bitchat_forward") or "bound")
+    data["bitchat_forward"] = mode if mode in ("bound", "custom", "all") \
+        else "bound"
     data["chat"] = cfg.get("chat", DEFAULT_CONFIG["chat"])
     try:
         with open(path, "w", encoding="utf-8") as fh:
@@ -671,9 +708,50 @@ _VIRTUAL_IFACE_HINTS = (
 )
 
 
-def _is_virtual_iface(name: str) -> bool:
-    low = name.lower()
+def _is_virtual_iface(name: str, description: str = "") -> bool:
+    """True for adapters that can never host a Meshtastic radio.
+
+    The check looks at the adapter *name* and at the driver description
+    Windows reports, because a VPN tunnel is often named by a bare code
+    (the VPN's Wintun adapter is just "wwan99") while its description still
+    says "Wintun Tunnel".  Without the description such an adapter stayed in
+    the sweep and added a whole /24 of dead addresses to every search.
+    """
+    low = f"{name} {description}".lower()
     return any(hint in low for hint in _VIRTUAL_IFACE_HINTS)
+
+
+def _iface_descriptions() -> dict:
+    """Adapter name -> driver description (Windows only, best effort).
+
+    psutil knows adapter names but not what driver backs them, so a tunnel
+    with a code-like name is indistinguishable from a real NIC.  Windows
+    itself reports the description ("Wintun Tunnel", "Intel(R) Wi-Fi", …),
+    which is what lets the search recognise it.  A missing or unreadable
+    answer is not an error: the caller simply keeps the name-only check.
+    """
+    if os.name != "nt":
+        return {}
+    # WMI is used instead of Get-NetAdapter: the console PowerShell starts
+    # with is in the OEM code page, so adapter names written in Russian come
+    # back as broken bytes and would never match psutil's names.  WMI hands
+    # the strings to Python as real Unicode.
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+             "Get-CimInstance Win32_NetworkAdapter | ForEach-Object { "
+             "$_.NetConnectionID + '|' + $_.Name }"],
+            capture_output=True, timeout=15)
+        text = completed.stdout.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return {}
+    described = {}
+    for line in text.splitlines():
+        name, _, description = line.partition("|")
+        if name.strip():
+            described[name.strip()] = description.strip()
+    return described
 
 
 def connected_networks() -> List[dict]:
@@ -696,6 +774,10 @@ def connected_networks() -> List[dict]:
     except Exception:  # noqa: BLE001
         return []
 
+    # Read the driver descriptions once: they are what marks a tunnel whose
+    # adapter name is only a code ("wwan99") as virtual.
+    descriptions = _iface_descriptions()
+
     physical: List[dict] = []
     virtual: List[dict] = []
 
@@ -714,6 +796,11 @@ def connected_networks() -> List[dict]:
             if (ip.is_loopback or ip.is_link_local or ip.is_unspecified
                     or ip.is_multicast):
                 continue
+            # 198.18.0.0/15 is reserved for benchmarking and is the default
+            # address range of tunnel/VPN adapters (Wintun, WireGuard).  No
+            # router or radio ever lives there.
+            if ip in ipaddress.IPv4Network("198.18.0.0/15"):
+                continue
 
             mask = getattr(snic, "netmask", None)
             try:
@@ -729,7 +816,8 @@ def connected_networks() -> List[dict]:
 
             entry = {"iface": name, "ip": str(ip), "cidr": str(net),
                      "network": net}
-            bucket = virtual if _is_virtual_iface(name) else physical
+            bucket = virtual if _is_virtual_iface(
+                name, descriptions.get(name, "")) else physical
             if all(other["cidr"] != entry["cidr"] for other in bucket):
                 bucket.append(entry)
 
@@ -757,14 +845,22 @@ async def _port_open(host: str, port: int, timeout: float = 0.3) -> bool:
 
 
 async def _scan_lan(port: int = MESHTASTIC_TCP_PORT,
-                    networks: Optional[List[dict]] = None) -> List[str]:
-    """Fast sweep: hosts in the connected networks that accept *port*."""
+                    networks: Optional[List[dict]] = None,
+                    skip: Optional[set] = None) -> List[str]:
+    """Fast sweep: hosts in the connected networks that accept *port*.
+
+    ``skip`` holds hosts that were already asked in an earlier wave: probing
+    them a second time would only repeat the same negative answer and is what
+    made a second wave take as long as the first.
+    """
     hosts: List[str] = []
     for entry in (connected_networks() if networks is None else networks):
         net = entry["network"]
         hosts.extend(str(host) for host in net.hosts())
 
     hosts = list(dict.fromkeys(hosts))
+    if skip:
+        hosts = [h for h in hosts if h not in skip]
     if not hosts:
         return []
 
@@ -779,18 +875,27 @@ async def _scan_lan(port: int = MESHTASTIC_TCP_PORT,
 
 
 async def _scan_lan_long(port: int = MESHTASTIC_TCP_PORT,
-                         networks: Optional[List[dict]] = None) -> List[str]:
+                         networks: Optional[List[dict]] = None,
+                         skip: Optional[set] = None) -> List[str]:
     """Slow pass for radios that answer late.
 
     Some ESP32 builds answer the very first connection several seconds after
     the request, so the fast sweep misses them.  This pass asks every host
     with a longer timeout, using a few connections at a time, so a busy
     network does not slow it down.
+
+    Hosts in ``skip`` already got their answer from the fast sweep and are not
+    asked again: a closed port that stayed closed for 0.3 s is the ordinary
+    case (every phone, printer and idle host on the network), and re-probing
+    all of them with a 2 s timeout is what turned a miss into a three-minute
+    wait.
     """
     hosts: List[str] = []
     for entry in (connected_networks() if networks is None else networks):
         hosts.extend(str(host) for host in entry["network"].hosts())
     hosts = list(dict.fromkeys(hosts))
+    if skip:
+        hosts = [h for h in hosts if h not in skip]
     if not hosts:
         return []
 
@@ -1011,6 +1116,9 @@ async def _discover_tcp_devices(port: int = MESHTASTIC_TCP_PORT,
     radios are found, a second sweep with a longer timeout follows: a radio
     that was busy at that moment (or answers its first request slowly) is
     asked again instead of silently missing from the list.
+
+    The second sweep only asks hosts the first one never reached (see
+    ``_scan_lan_long``), so a missing radio costs seconds, not minutes.
     """
     def say(*args) -> None:
         if not quiet:
@@ -1021,7 +1129,7 @@ async def _discover_tcp_devices(port: int = MESHTASTIC_TCP_PORT,
     verified = _verify_hosts(hosts, port) if hosts else []
     if len(verified) < 2:
         say("  перепроверяю с большим терпением...")
-        slow = await _scan_lan_long(port, networks)
+        slow = await _scan_lan_long(port, networks, skip=set(hosts))
         extra = [h for h in slow if h not in {v[0] for v in verified}]
         if extra:
             verified.extend(_verify_hosts(extra, port))
@@ -2119,6 +2227,24 @@ class BitchatBLEHandler:
         # Full two-way sync: forward every incoming message to the other side
         # immediately, in addition to the normal one-way behaviour.
         self.full_sync = bool(full_sync)
+        # Which Bitchat senders may reach LoRa (see DEFAULT_CONFIG):
+        #   "bound"  — only the bound phone (strict, default);
+        #   "custom" — the bound phone plus peer ids listed in
+        #              ``bitchat_sources`` (every key proven by an announce);
+        #   "all"    — any sender that arrives on the phone link, including
+        #              fragments with no verifiable signature (a fragment
+        #              carries only a sender id, so authorship cannot be
+        #              proven there — the user accepts this explicitly).
+        # "custom" never becomes active without its list, so a plain restart
+        # cannot silently widen what leaves the radio.
+        self.forward_mode: str = "bound"
+        self.bitchat_sources: set = set()
+        # Address of the link the current chain of fragments arrived on; it
+        # picks the right per-link fragment table in _handle_fragment.
+        self._fragment_addr: Optional[str] = None
+        # Forward mode remembered in the config file.  "custom" is kept
+        # strict until its (never stored) phone list is picked in the console.
+        self.saved_forward_mode: str = "bound"
         self.connected: Dict[str, BleakClient] = {}
         self.connecting: set = set()
         # Addresses that carried the bound phone during this session; they are
@@ -2134,8 +2260,17 @@ class BitchatBLEHandler:
         self.advertised_peers: Dict[str, str] = {}
         self.meshtastic: Optional[MeshtasticHandler] = None
         self.peer_nicknames: Dict[str, str] = {}
+        # Announce nickname of a peer that is not the bound phone, keyed by
+        # "peer:<id>" — kept apart so the bound phone's name can never be
+        # overwritten.  BLE name per address is only a last resort for peers
+        # which never announced.
+        self.peer_aliases: Dict[str, str] = {}
+        self.peer_hostnames: Dict[str, str] = {}
         self._seen_packets: deque = deque(maxlen=200)
-        self._fragments: Dict[bytes, dict] = {}
+        # Reassembled frames, keyed by (BLE address, fragment id): a fragment
+        # table per link, so a fragment from a second phone can never be glued
+        # into a frame that the first phone started.
+        self._fragments: Dict[Tuple[str, bytes], dict] = {}
         self._stopping = False
         self._bluetooth_warned = False
         # Last N Bitchat messages, kept for the manual "send last 5/10/20/50"
@@ -2223,7 +2358,7 @@ class BitchatBLEHandler:
 
     def _handle_packet(self, sender: bytes, packet_type: int, timestamp: int,
                        flags: int, payload: bytes, raw: Optional[bytes] = None,
-                       client=None) -> None:
+                       client=None, source_addr: Optional[str] = None) -> None:
         if sender == self.my_id:
             return
         key = (sender, timestamp, packet_type)
@@ -2234,14 +2369,25 @@ class BitchatBLEHandler:
         short_id = sender.hex()[-4:]
         if packet_type == TYPE_ANNOUNCE:
             # An announce carries the key that has to verify it, so it is
-            # checked only after its fields are read (and only once).
-            self._handle_announce(sender, payload, short_id, raw, client)
+            # checked only after its fields are read (and only once).  It is
+            # read even while the mode refuses it: the key is what a later
+            # message from this peer will be checked against.
+            self._handle_announce(sender, payload, short_id, raw, client,
+                                  source_addr=source_addr)
+            return
+
+        if packet_type not in (TYPE_MESSAGE, TYPE_FRAGMENT):
+            # Service traffic (group, noise, voice, files, relayed Nostr, …).
+            # Its body is ciphertext or binary, so it can never become a LoRa
+            # message; it is dropped before any decoding or signature work.
+            log.debug("Пропущен служебный пакет %s типа 0x%02x", short_id,
+                      packet_type)
             return
 
         # Everything else is checked against the key learned from a verified
         # announce, before anything is decoded, so unverified data never
         # reaches the text pipeline.
-        if not self._packet_allowed(sender, raw):
+        if not self._packet_allowed(sender, raw, source_addr):
             self._rejected_packets += 1
             log.debug("Отклонён пакет %s: не подтверждён или не наш пир",
                       short_id)
@@ -2254,19 +2400,72 @@ class BitchatBLEHandler:
             text = payload.decode("utf-8", errors="ignore")
 
         if packet_type == TYPE_MESSAGE:
-            name = self.peer_nicknames.get(sender.hex(), short_id)
-            self._on_bitchat_text(text, name)
+            name = self._display_name(sender, source_addr)
+            self._on_bitchat_text(text, name, sender.hex())
 
-    def _packet_allowed(self, sender: bytes, raw: Optional[bytes]) -> bool:
-        """True only for the bound phone and a verified signature."""
+    def _packet_allowed(self, sender: bytes, raw: Optional[bytes],
+                        source_addr: Optional[str] = None) -> bool:
+        """True for a sender that may reach LoRa, with a verified signature.
+
+        The rule depends on ``forward_mode`` (see __init__):
+
+        * ``bound`` — exactly the bound phone, signature verified;
+        * ``custom`` — the bound phone or one of ``bitchat_sources``, each
+          proven by its own self-signed announce;
+        * ``all`` — the bound phone, any chosen phone, and any sender whose key
+          is not known yet.  Once a peer's key is known (from its verified
+          announce) this mode *requires* a valid signature from it: a frame
+          that claims that peer id but carries no signature, or a bad one, is
+          refused.  Only a peer never heard of before is accepted by id alone,
+          because that is all the client delivered.  A fragment never carries
+          a signature, so its authorship is never provable.
+
+        The bound phone is still the only phone that may *receive* traffic;
+        these modes only decide what may be *forwarded to LoRa*.
+        """
         peer = sender.hex()
-        if self.bound_peer and peer != self.bound_peer:
+        is_bound = bool(self.bound_peer) and peer == self.bound_peer
+        # Fallback: the link that delivered the packet is proven to belong
+        # to the bound phone (its announce was checked at connect time), so
+        # its own packets do not need a second check.
+        from_bound_link = bool(source_addr) and \
+            self.peer_ids.get(source_addr) == self.bound_peer
+
+        if self.forward_mode == "all":
+            key = self.peer_keys.get(peer)
+            if key is not None:
+                # We know this peer's key, so we can check it: a missing or a
+                # bad signature is a refusal, not a pass.  Without this, anyone
+                # who copied the peer id of a known phone could slip an
+                # unsigned frame in under its name.
+                if raw is None:
+                    return False
+                return verify_packet_signature(bytes(raw), key)
+            # Key unknown: the id is all the client gave us.  Accepted by the
+            # owner's explicit choice for this mode; a later announce with a
+            # real key makes the check above active for this peer.
+            return True
+
+        allowed = is_bound or from_bound_link
+        if not allowed and self.forward_mode == "custom":
+            allowed = peer in self.bitchat_sources
+        if not allowed:
             return False
-        if not self.bound_peer:
-            return False
+
+        if self.forward_mode == "custom" and peer in self.bitchat_sources:
+            # A chosen phone is trusted by the key it proved with its own
+            # announce; the packet is still checked when its frame carries a
+            # signature (a reassembled fragment carries none).
+            key = self.peer_keys.get(peer)
+            if key is not None and raw is not None:
+                return verify_packet_signature(bytes(raw), key)
+            return True
+
         key = self.peer_keys.get(peer)
         if not key:
-            return False
+            # No verified key for this sender: accept only the bound phone's
+            # own packets that arrived over its proven link.
+            return is_bound or from_bound_link
         if raw is None:
             return False
         return verify_packet_signature(bytes(raw), key)
@@ -2283,6 +2482,30 @@ class BitchatBLEHandler:
         except RuntimeError:  # called from a non-async thread
             asyncio.run_coroutine_threadsafe(self.broadcast(text), self.loop)
 
+    # Bridge commands; only the bound phone may use them.
+    COMMANDS = ("/help", "/?", "/помощь", "/ch", "/channels", "/каналы",
+                "/sync", "/синхро", "/синхронизация")
+
+    def _answer_command(self, low: str) -> None:
+        if low in ("/help", "/?", "/помощь"):
+            self._reply_to_bitchat(
+                "[Bridge] Сообщения в LoRa автоматически не уходят. "
+                "Они копятся здесь; в консоли нажмите «s» и выберите "
+                "«Bitchat → Meshtastic», количество и период. "
+                "«/ch» — каналы, «#N текст» и «/dm узел текст» — адресация."
+            )
+        elif low in ("/ch", "/channels", "/каналы"):
+            if self.meshtastic:
+                self._reply_to_bitchat(self.meshtastic.describe_channels())
+            else:
+                self._reply_to_bitchat("[Bridge] радио Meshtastic недоступно.")
+        elif low in ("/sync", "/синхро", "/синхронизация"):
+            self._reply_to_bitchat(
+                "[Bridge] Синхронизация запускается из консоли моста: "
+                "нажмите «s» и выберите направление, количество (5/10/20/50) "
+                "и при желании период повтора."
+            )
+
     def _is_echo(self, text: str) -> bool:
         """Ignore messages that the bridge itself injected into Bitchat."""
         if text.startswith(("[Mesh:", "[Mesh DM:", "[Bridge]")):
@@ -2294,36 +2517,62 @@ class BitchatBLEHandler:
                 return True
         return False
 
-    def _on_bitchat_text(self, text: str, name: str) -> None:
-        """Buffer a Bitchat message; never forward it to LoRa automatically."""
+    def _display_name(self, sender: bytes, source_addr: Optional[str] = None) -> str:
+        """A sender name safe for a prefix on the LoRa side.
+
+        Preference: the announce nickname, then an alias learned from that
+        peer's announce, then the BLE name of the link, then the peer id.
+        Control characters are dropped and the name is limited to 32
+        characters, so a hostile peer cannot forge protocol lines or fill the
+        LoRa packet with its own name.
+        """
+        peer = sender.hex()
+        candidates = [self.peer_nicknames.get(peer),
+                      self.peer_aliases.get(f"peer:{peer}")]
+        if source_addr:
+            candidates.append(self.peer_hostnames.get(source_addr, ""))
+        for raw_name in candidates:
+            name = self._clean_name(raw_name)
+            if name:
+                return name
+        return f"@{peer[:4]}"
+
+    @staticmethod
+    def _clean_name(raw_name) -> str:
+        """One printable line, at most 32 characters ("" when unusable)."""
+        if not raw_name:
+            return ""
+        name = "".join(ch for ch in str(raw_name)
+                       if ch.isprintable() and ch not in "[]\r\n")
+        return " ".join(name.split())[:32]
+
+    def _on_bitchat_text(self, text: str, name: str,
+                         peer: Optional[str] = None) -> None:
+        """Buffer a Bitchat message; never forward it to LoRa automatically.
+
+        ``peer`` is the peer id of the author (hex).  It is stored with the
+        entry so that a later "Bitchat → LoRa" sync can tell whose message it
+        is, and so the console can show a foreign author only when the chosen
+        forwarding mode actually allows it to leave the bridge.
+        """
         stripped = text.strip()
         if not stripped or self._is_echo(stripped):
             return
-
+        peer_key = (peer or "").lower()
+        is_bound = bool(self.bound_peer) and peer_key == self.bound_peer
+        clean = self._clean_name(name) or (
+            f"@{peer_key[:4]}" if peer_key else "Bitchat")
         low = stripped.lower()
-        if low in ("/help", "/?", "/помощь"):
-            self._reply_to_bitchat(
-                "[Bridge] Сообщения в LoRa автоматически не уходят. "
-                "Они копятся здесь; в консоли нажмите «s» и выберите "
-                "«Bitchat → Meshtastic», количество и период. "
-                "«/ch» — каналы, «#N текст» и «/dm узел текст» — адресация."
-            )
+        if low in self.COMMANDS:
+            if is_bound:
+                self._answer_command(low)
             return
+        self._buffer_text(stripped, clean, peer_key, is_bound)
 
-        if low in ("/ch", "/channels", "/каналы"):
-            if self.meshtastic:
-                self._reply_to_bitchat(self.meshtastic.describe_channels())
-            else:
-                self._reply_to_bitchat("[Bridge] радио Meshtastic недоступно.")
-            return
-
-        if low in ("/sync", "/синхро", "/синхронизация"):
-            self._reply_to_bitchat(
-                "[Bridge] Синхронизация запускается из консоли моста: "
-                "нажмите «s» и выберите направление, количество (5/10/20/50) "
-                "и при желании период повтора."
-            )
-            return
+    def _buffer_text(self, stripped: str, clean: str, peer_key: str,
+                     is_bound: bool) -> None:
+        """Queue the message (with the author's name) for a later LoRa sync."""
+        foreign = not is_bound
 
         channel, destination = (0, None)
         if self.meshtastic:
@@ -2342,12 +2591,18 @@ class BitchatBLEHandler:
                 body_text = match.group(2).strip()
             else:
                 body_text = stripped
+        # Ready-to-send line: the author's name goes with the text, so the
+        # LoRa chat can see who wrote it in Bitchat.  An explicit "/dm"
+        # target stays a destination; the name still goes into the body.
+        body_text = f"[Бит: {clean}] {body_text}"
 
         # No text is kept outside the sealed body: not even a short preview
         # for the console or the buffer list.
         entry = {
             "ts": time.time(),
-            "name": name,
+            "name": clean,
+            "peer": peer_key,
+            "foreign": foreign,
             "sealed": seal_text(body_text),
             "preview": "",
             "channel": max(0, min(7, int(channel))),
@@ -2356,17 +2611,49 @@ class BitchatBLEHandler:
         }
         self.history_bitchat.append(entry)
         collapse_duplicate_entries(self.history_bitchat)
-        log.info("(BLE -> LoRa буфер) %s: %d символов", name, len(body_text))
-        if self.full_sync and self.meshtastic:
+        log.info("(BLE -> LoRa буфер) %s: %d символов", clean, len(body_text))
+        if self.full_sync and self.meshtastic and self.may_forward(peer_key):
             # Full two-way mode: forward at once, still via the rate-limited
             # LoRa queue so the air is not flooded.
             self.meshtastic.send_history_entry(entry)
-            say(f"[Bitchat] {name}: сообщение ({len(body_text)} симв.) "
+            say(f"[Bitchat] {clean}: сообщение ({len(body_text)} симв.) "
                 "в очереди на LoRa")
             return
-        say(f"[Bitchat] {name}: сообщение ({len(body_text)} симв.) "
+        if foreign:
+            say(f"[Bitchat] {clean}: сообщение ({len(body_text)} симв.) "
+                f"(чужой пир, в буфере {len(self.history_bitchat)}, "
+                "в LoRa не уйдёт в текущем режиме)")
+            return
+        say(f"[Bitchat] {clean}: сообщение ({len(body_text)} симв.) "
             f"(в буфере {len(self.history_bitchat)}, "
             "ждёт ручной синхронизации)")
+
+    def may_forward(self, peer: Optional[str]) -> bool:
+        """True when a message from this peer may leave for LoRa.
+
+        Same rule as _packet_allowed, without the signature (the signature
+        was checked when the packet arrived).  Used before queueing a synced
+        entry, so a buffer item can never bypass the chosen mode.
+        """
+        peer = (peer or "").lower()
+        if not peer:
+            return False
+        if self.bound_peer and peer == self.bound_peer:
+            return True
+        if self.forward_mode == "all":
+            return True
+        if self.forward_mode == "custom":
+            return peer in self.bitchat_sources
+        return False
+
+    def set_forward_mode(self, mode: str) -> None:
+        """Switch the Bitchat → LoRa forwarding mode (console action)."""
+        if mode not in ("bound", "custom", "all"):
+            mode = "bound"
+        self.forward_mode = mode
+        if mode != "custom":
+            self.bitchat_sources.clear()
+        log.info("Bitchat -> LoRa: режим %s", mode)
 
     @staticmethod
     def _parse_announce_nickname(payload: bytes) -> Optional[str]:
@@ -2388,7 +2675,8 @@ class BitchatBLEHandler:
         return None
 
     def _handle_announce(self, sender: bytes, payload: bytes, short_id: str,
-                         raw: Optional[bytes] = None, client=None) -> None:
+                         raw: Optional[bytes] = None, client=None,
+                         source_addr: Optional[str] = None) -> None:
         fields = parse_announce_fields(payload)
         nickname = (fields.get(0x01) or b"").decode("utf-8", "ignore") or None
         signing_pub = fields.get(0x03)
@@ -2409,11 +2697,26 @@ class BitchatBLEHandler:
         key = sender.hex()
         self.peer_keys[key] = signing_pub
         self.peer_fingerprints[key] = peer_fingerprint(signing_pub)
-        if nickname and self.peer_nicknames.get(key) != nickname:
-            self.peer_nicknames[key] = nickname
+        # The bound phone keeps its own names table; every other peer gets an
+        # alias, so a stranger can never rename (or spoof) the bound phone.
+        bound = self.bound_peer is not None and key == self.bound_peer
+        table = self.peer_nicknames if bound else self.peer_aliases
+        table_key = key if bound else f"peer:{key}"
+        if nickname and table.get(table_key) != nickname:
+            table[table_key] = nickname
             log.info("Пир %s теперь известен как «%s»", short_id, nickname)
 
-    def _handle_fragment(self, sender: bytes, payload: bytes, flags: int) -> None:
+    def _handle_fragment(self, sender: bytes, payload: bytes, flags: int,
+                         source_addr: Optional[str] = None) -> None:
+        """Collect one fragment; hand the reassembled frame to _handle_packet.
+
+        A fragment itself has no signature — only the 8-byte sender id in its
+        header — so the reassembled frame is re-checked by _handle_packet
+        exactly like a direct packet.  The table is keyed by link address and
+        fragment id, so fragments from different phones can never be glued
+        together (which would otherwise let anyone splice words into another
+        sender's message).
+        """
         if len(payload) < 13:
             return
         frag_id = payload[:8]
@@ -2423,21 +2726,34 @@ class BitchatBLEHandler:
         chunk = payload[13:]
         if total <= 0 or total > 10000 or index >= total:
             return
+        if inner_type not in (TYPE_MESSAGE, TYPE_ANNOUNCE):
+            # A fragment chain of group/noise/voice traffic can never become a
+            # LoRa message: refuse it here so a filler cannot occupy memory
+            # until the whole chain arrives.
+            return
+        table_key = (source_addr or "", frag_id)
         entry = self._fragments.setdefault(
-            frag_id, {"total": total, "type": inner_type, "parts": {}, "ts": time.time()}
+            table_key, {"sender": sender, "total": total,
+                        "type": inner_type, "parts": {}, "ts": time.time()}
         )
+        if entry["sender"] != sender:
+            # A different sender under the same fragment id on the same link:
+            # an inconsistent chain, dropped rather than trusted.
+            del self._fragments[table_key]
+            return
         entry["parts"][index] = chunk
         entry["ts"] = time.time()
 
         if len(entry["parts"]) == entry["total"]:
             data = b"".join(entry["parts"][i] for i in range(entry["total"]))
-            del self._fragments[frag_id]
+            del self._fragments[table_key]
             parsed = self._parse_packet(data)
             if parsed:
-                self._handle_packet(*parsed)
+                self._handle_packet(*parsed, source_addr=source_addr)
 
         now = time.time()
-        for k in [k for k, v in self._fragments.items() if now - v["ts"] > 60]:
+        for k in [k for k, v in list(self._fragments.items())
+                  if now - v["ts"] > 60]:
             del self._fragments[k]
 
     @staticmethod
@@ -2473,10 +2789,11 @@ class BitchatBLEHandler:
             if packet_type == TYPE_ANNOUNCE:
                 self.peer_ids[addr] = sender.hex()
             if packet_type == TYPE_FRAGMENT:
-                self._handle_fragment(sender, payload, flags)
+                self._handle_fragment(sender, payload, flags, source_addr=addr)
             else:
                 self._handle_packet(sender, packet_type, timestamp, flags,
-                                    payload, raw=bytes(data), client=client)
+                                    payload, raw=bytes(data), client=client,
+                                    source_addr=addr)
         except Exception as exc:  # noqa: BLE001
             log.error("Ошибка BLE-пакета (%s): %s", client.address, exc)
 
@@ -2930,7 +3247,12 @@ class BitchatBLEHandler:
             return sent
 
     async def resend_bitchat(self, count: int, only_new: bool = False) -> int:
-        """Queue the last N Bitchat messages for rate-limited LoRa sending."""
+        """Queue the last N Bitchat messages for rate-limited LoRa sending.
+
+        Entries whose author is not allowed by the current forwarding mode
+        are skipped (not marked as dropped), so switching the mode later can
+        still send them on an explicit request.
+        """
         if not self.meshtastic:
             return 0
         entries = list(self.history_bitchat)
@@ -2942,6 +3264,8 @@ class BitchatBLEHandler:
         queued = 0
         for entry in entries:
             if entry.get("queued_lora") and not entry.get("sent_lora"):
+                continue
+            if not self.may_forward(entry.get("peer")):
                 continue
             self.meshtastic.send_history_entry(entry)
             queued += 1
@@ -3068,6 +3392,7 @@ class BitchatBLEHandler:
         for entry in list(self.history_bitchat):
             entry["sealed"] = b""
             entry["preview"] = ""
+        self._fragments.clear()
         if self.meshtastic:
             for entry in list(self.meshtastic.history_lora):
                 entry["sealed"] = b""
@@ -3457,6 +3782,239 @@ def confirm_private_channel(ble: "BitchatBLEHandler", purpose: str) -> bool:
     return True
 
 
+# --------------------------------------------------------------------------
+# Bitchat -> LoRa forwarding modes ("b" in the console)
+# --------------------------------------------------------------------------
+# Simple rules, deliberately:
+#   bound  — only the phone the bridge is bound to (default);
+#   custom — the bound phone plus phones chosen from a list;
+#   all    — everything that reaches the phone link.
+# Only the *mode* is written to the config file, never the list of phones,
+# and the mode never widens a private channel without the usual two "yes".
+
+FORWARD_WARNING_ALL = (
+    "ВНИМАНИЕ: режим «всё, что приходит на телефон».\n"
+    "Мост будет пересылать в LoRa сообщения любых авторов, которые дойдут\n"
+    "до телефона. В цепочке фрагментов нет подписи, поэтому автора в таком\n"
+    "режиме можно подделать, а часть сообщений группы до моста не дойдёт.\n"
+    "Имена авторов берутся из их announce или остаются в виде @xxxx.")
+
+FORWARD_WARNING_CUSTOM = (
+    "ВНИМАНИЕ: пересылка от выбранных телефонов Bitchat.\n"
+    "Мост будет пересылать в LoRa сообщения не только привязанного\n"
+    "телефона, но и тех пиров, которых вы отметите. Их подпись проверяется\n"
+    "по ключу из announce, но увидите вы лишь то, что телефон переслал.")
+
+FORWARD_HINT = ("(подсказка: список обновляется по мере поступления announce "
+                "от Bitchat-пиров)")
+
+
+def _peer_label(ble: "BitchatBLEHandler", peer: str) -> str:
+    """One console line for a known Bitchat peer (never the message text)."""
+    peer = (peer or "").lower()
+    if not peer:
+        return "?"
+    if ble.bound_peer and peer == ble.bound_peer:
+        mark = " [привязан]"
+    elif peer in ble.bitchat_sources:
+        mark = " [выбран]"
+    else:
+        mark = ""
+    nick = ble.peer_nicknames.get(peer) or \
+        ble.peer_aliases.get(f"peer:{peer}") or ""
+    fp = ble.peer_fingerprints.get(peer) or ""
+    parts = [peer]
+    if nick:
+        parts.append(f"«{nick}»")
+    if fp:
+        parts.append(fp)
+    return " — ".join(parts) + mark
+
+
+def _known_peers(ble: "BitchatBLEHandler") -> List[str]:
+    """Peer ids whose announce passed the signature check this session."""
+    peers = set(ble.peer_keys.keys())
+    if ble.bound_peer:
+        peers.add(ble.bound_peer)
+    peers.update(ble.bitchat_sources)
+    return sorted(peers, key=lambda p: (p != ble.bound_peer, p))
+
+
+def _scan_new_phones(ble: "BitchatBLEHandler",
+                     seconds: float) -> int:
+    """Find Bitchat phones nearby and remember the peers that answer.
+
+    A scan is only useful while no link is up: probing a second phone would
+    steal airtime from the bound phone and can make iOS drop the bridge.
+    The result only fills the peer list; nothing extra is accepted here.
+    """
+    if ble.connected or ble.connecting:
+        print("Телефон уже подключён — сканирование пропущено, чтобы не "
+              "мешать связи. Список пополняется announce-пакетами.")
+        return 0
+    phones = scan_bitchat_peers(seconds)
+    added = 0
+    for phone in phones:
+        peer = (phone.get("peer") or "").lower()
+        if not peer or not phone.get("signature_ok", True):
+            continue
+        if not ble.peer_keys.get(peer) and phone.get("signing_pub"):
+            ble.peer_keys[peer] = phone["signing_pub"]
+            ble.peer_fingerprints[peer] = phone.get("fingerprint")
+        nick = phone.get("nickname")
+        if nick:
+            key = peer if peer == ble.bound_peer else f"peer:{peer}"
+            table = ble.peer_nicknames if peer == ble.bound_peer \
+                else ble.peer_aliases
+            table[key] = nick
+        if peer not in ble.peer_keys:
+            continue
+        added += 1
+    print(f"Найдено телефонов Bitchat: {len(phones)}, с проверенным "
+          f"announce: {added}")
+    return added
+
+
+def _pick_sources(ble: "BitchatBLEHandler", want: Optional[int] = None) -> bool:
+    """Pick phones for the "custom" mode: numbers in one line, comma-separated.
+
+    ``want`` is the source count the owner asked for ("two phones", "a hundred
+    phones").  It is only used for the hint line: a list may hold any number of
+    peers, above it the bridge never guesses which ones were meant.  Returns
+    True when a non-empty list was stored.
+    """
+    while True:
+        peers = _known_peers(ble)
+        print()
+        print("Известные Bitchat-пиры (подпись проверена):")
+        for i, peer in enumerate(peers, 1):
+            print(f"  {i}) {_peer_label(ble, peer)}")
+        print("  s) найти телефоны через Bluetooth")
+        print("  0) назад")
+        if want:
+            print(f"Выберите {want} телефонов-источников "
+                  "(привязанный и так входит всегда).")
+        print(FORWARD_HINT)
+        try:
+            raw = input("Номера через запятую (125 = 1,2,5): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        low = raw.lower()
+        if low in ("", "0", "q", "назад", "отмена"):
+            return False
+        if low in ("s", "scan", "поиск", "сканировать"):
+            # The bound phone is skipped on purpose: it already is a source.
+            _scan_new_phones(ble, ble.scan_seconds * 2)
+            continue
+        chosen = set()
+        for token in re.split(r"[,\s;]+", raw):
+            if not token:
+                continue
+            if not token.isdigit():
+                print(f"Не понял «{token}» — введите номера.")
+                chosen.clear()
+                break
+            index = int(token)
+            if not 1 <= index <= len(peers):
+                print(f"Нет номера {index}.")
+                chosen.clear()
+                break
+            peer = peers[index - 1]
+            if ble.bound_peer and peer == ble.bound_peer:
+                continue  # it is always a source in every mode
+            chosen.add(peer)
+        if not chosen:
+            print("Ничего не выбрано.")
+            continue
+        ble.bitchat_sources = chosen
+        print("Выбрано пиров: " + str(len(chosen)))
+        return True
+
+
+def _forward_mode_name(ble: "BitchatBLEHandler") -> str:
+    """One human line describing what currently leaves for LoRa."""
+    if ble.forward_mode == "all":
+        return "любой телефон, чьи сообщения дошли до моста"
+    if ble.forward_mode == "custom":
+        return (f"привязанный + {len(ble.bitchat_sources)} выбранных "
+                "телефонов")
+    return "только привязанный телефон"
+
+
+def _confirm_forward(text: str) -> bool:
+    """Two explicit "yes", the same rule as for a private channel."""
+    print()
+    print(text)
+    first = _typed_yes("Введите yes для подтверждения: ")
+    second = first and _typed_yes("Введите yes ещё раз: ")
+    return bool(second)
+
+
+def console_forward_menu(ble: "BitchatBLEHandler",
+                         loop: asyncio.AbstractEventLoop,
+                         on_change=None) -> None:
+    """Console menu "b": which phones may send to LoRa.
+
+    The owner chooses by *source*, not by an internal mode name, because that
+    is how the question is actually asked: one phone, two phones, many phones,
+    or anything that reaches the bridge.  "Two" and "a hundred" are the same
+    stored mode (``custom``) and differ only in how many peers the list holds;
+    the list itself is never written to the config file.
+    """
+    while True:
+        mode = ble.forward_mode
+        print()
+        print(f"Bitchat → LoRa сейчас: {_forward_mode_name(ble)}")
+        print("Откуда брать сообщения для LoRa:")
+        print("  1) один телефон — только привязанный")
+        print("  2) два телефона — привязанный + ещё один")
+        print("  3) много телефонов — привязанный + список")
+        print("  4) любой телефон — всё, что доходит до моста")
+        print("  0) назад")
+        choice = _read_choice("Пункт: ", {"1", "2", "3", "4"})
+        if choice is None:
+            return
+
+        # 1) One phone: the plain default, no confirmation needed.
+        if choice == "1":
+            ble.set_forward_mode("bound")
+            print("В LoRa пойдут только сообщения привязанного телефона.")
+            if on_change:
+                on_change("bound")
+            continue
+
+        # 2) and 3) are the same mode with a different size of the list.
+        if choice in ("2", "3"):
+            want = 1 if choice == "2" else None
+            if not _pick_sources(ble, want):
+                continue
+            count = len(ble.bitchat_sources)
+            if choice == "2" and count > 1:
+                print(f"Отмечено {count} телефонов: в LoRa пойдут сообщения "
+                      "всех отмеченных и привязанного.")
+            print()
+            print(FORWARD_WARNING_CUSTOM)
+            if not _confirm_forward("Подтвердите этот выбор."):
+                ble.bitchat_sources = set()
+                print("Режим не изменён.")
+                continue
+            ble.set_forward_mode("custom")
+            say(f"[Bitchat] в LoRa идут сообщения от {count} выбранных "
+                "пиров + привязанного телефона")
+            if on_change:
+                on_change("custom")
+            continue
+
+        # 4) Any phone: the widest rule, so it asks for the same two "yes".
+        if not _confirm_forward(FORWARD_WARNING_ALL):
+            print("Режим не изменён.")
+            continue
+        ble.set_forward_mode("all")
+        say("[Bitchat] в LoRa идут сообщения от любых авторов")
+        if on_change:
+            on_change("all")
+
+
 def console_sync_menu(ble: "BitchatBLEHandler", mesh: "MeshtasticHandler",
                       scheduler: SyncScheduler, loop: asyncio.AbstractEventLoop) -> None:
     print()
@@ -3489,12 +4047,22 @@ def console_sync_menu(ble: "BitchatBLEHandler", mesh: "MeshtasticHandler",
             if ble.connected:
                 asyncio.run_coroutine_threadsafe(ble.flush_undelivered(), loop)
             queued = 0
+            skipped = 0
             for entry in list(ble.history_bitchat):
-                if not entry.get("sent_lora") and not entry.get("queued_lora"):
-                    mesh.send_history_entry(entry)
-                    queued += 1
+                if entry.get("sent_lora") or entry.get("queued_lora"):
+                    continue
+                # The forwarding mode decides what may leave, also here:
+                # a full sync must not push a stranger's message out.
+                if not ble.may_forward(entry.get("peer")):
+                    skipped += 1
+                    continue
+                mesh.send_history_entry(entry)
+                queued += 1
             if queued:
                 say(f"[Sync] в очередь LoRa поставлено: {queued}")
+            if skipped:
+                say(f"[Sync] не отправлено по режиму пересылки: {skipped} "
+                    "(меню «b»)")
         else:
             say("[Sync] полная синхронизация выключена: Bitchat → LoRa снова "
                 "только вручную.")
@@ -3642,26 +4210,35 @@ async def periodic_sync_loop(ble: "BitchatBLEHandler",
 
 def console_loop(ble: "BitchatBLEHandler", mesh: "MeshtasticHandler",
                  scheduler: SyncScheduler, stop_event: asyncio.Event,
-                 loop: asyncio.AbstractEventLoop) -> None:
+                 loop: asyncio.AbstractEventLoop,
+                 on_forward_change=None) -> None:
     print()
     print("Мост работает. Команды в консоли:")
     print("  s — синхронизация (направление, 5/10/20/50, период)")
+    print("  b — что пересылать из Bitchat в LoRa (телефоны)")
     print("  l — состояние буферов и расписания")
     print("  r — сброс привязки телефона (потребует повторного подтверждения)")
     print("  q — выход")
     print()
 
+    def _help() -> None:
+        print("  s — синхронизация, b — источники Bitchat → LoRa, "
+              "l — состояние, r — сброс привязки, q — выход")
+
     while not stop_event.is_set():
         try:
             raw = input("> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            loop.call_soon_threadsafe(stop_event.set)
+            loop.call_soon(stop_event.set)
             return
         if raw in ("q", "quit", "exit", "выход"):
-            loop.call_soon_threadsafe(stop_event.set)
+            loop.call_soon(stop_event.set)
             return
         if raw in ("s", "sync", "с", "синхронизация"):
             console_sync_menu(ble, mesh, scheduler, loop)
+            continue
+        if raw in ("b", "bit", "источники", "б"):
+            console_forward_menu(ble, loop, on_change=on_forward_change)
             continue
         if raw in ("l", "list", "status", "состояние"):
             print()
@@ -3672,6 +4249,12 @@ def console_loop(ble: "BitchatBLEHandler", mesh: "MeshtasticHandler",
                   f"{len(mesh.pending_texts)} в очереди на отправку")
             bound = ble.bound_peer or "не привязан"
             print(f"  Телефон: {bound}")
+            names = {"bound": "только привязанный телефон",
+                     "custom": "привязанный + выбранные",
+                     "all": "любой телефон, дошедший до моста"}
+            print(f"  Bitchat → LoRa: {names.get(ble.forward_mode, ble.forward_mode)}"
+                  + (f" ({len(ble.bitchat_sources)} выбранных)"
+                     if ble.forward_mode == "custom" else ""))
             print(f"  Режим: {'полная синхронизация в обе стороны' if ble.full_sync else 'авто только LoRa → Bitchat'}")
             print(f"  {scheduler.describe()}")
             print()
@@ -3691,6 +4274,8 @@ def console_loop(ble: "BitchatBLEHandler", mesh: "MeshtasticHandler",
             ble.bound_peer = None
             ble.target_peer = None
             ble.private_confirmed = False
+            ble.bitchat_sources = set()
+            ble.set_forward_mode("bound")
             for addr, client in list(ble.connected.items()):
                 ble.connected.pop(addr, None)
                 ble._last_seen.pop(addr, None)
@@ -3704,13 +4289,11 @@ def console_loop(ble: "BitchatBLEHandler", mesh: "MeshtasticHandler",
                   "чтобы подтвердить новый телефон.")
             continue
         if raw in ("h", "?", "help", "помощь"):
-            print("  s — синхронизация, l — состояние, r — сброс привязки, "
-                  "q — выход")
+            _help()
             continue
         if not raw:
             continue
-        print("Команды: s — синхронизация, l — состояние, r — сброс привязки, "
-              "q — выход")
+        _help()
 
 
 # --------------------------------------------------------------------------
@@ -3724,7 +4307,9 @@ async def run(transport: Optional[dict], name: str, scan_seconds: float,
               console: bool = False,
               bitchat_target: Optional[str] = None,
               full_sync: bool = False,
-              bitchat_peer: Optional[str] = None) -> int:
+              bitchat_peer: Optional[str] = None,
+              forward_mode: str = "bound",
+              config_path: Optional[str] = None) -> int:
     loop = asyncio.get_running_loop()
     # Harden the process before any message can arrive: no crash dumps for
     # the interpreter, no debugger or dump tool attached to this process,
@@ -3745,7 +4330,15 @@ async def run(transport: Optional[dict], name: str, scan_seconds: float,
     mesh.set_chat_target(chat_target or {"kind": "all"})
     ble.set_meshtastic_handler(mesh)
     mesh.set_ble_handler(ble)
-
+    # Which Bitchat senders may reach LoRa.  The mode comes from the user's
+    # choice (config file or --bitchat-forward) and decides what the phone
+    # part may forward.  The list of extra phones ("custom") is never stored:
+    # without it, a start falls back to the strict mode, so a restart after a
+    # power blip can never silently widen what leaves the radio.
+    mode = forward_mode if forward_mode in ("bound", "custom", "all") else "bound"
+    if mode == "custom":
+        mode = "bound"
+    ble.set_forward_mode(mode)
     await asyncio.to_thread(mesh.start)
 
     # Once the radio is reachable, let the user bind the bridge to a chat.
@@ -3772,9 +4365,24 @@ async def run(transport: Optional[dict], name: str, scan_seconds: float,
 
     console_thread = None
     if console:
+        # A change of the forwarding mode made in the console is written to
+        # the config file, so a power blip (and the restart that follows) does
+        # not lose it.  It happens in the console thread and is best effort:
+        # a read-only config directory must not break the bridge.
+        def _remember_mode(mode: str) -> None:
+            if not config_path:
+                return
+            try:
+                cfg = load_config(config_path)
+                cfg["bitchat_forward"] = mode
+                save_config(config_path, cfg)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Не удалось сохранить режим пересылки: %s", exc)
+
         console_thread = threading.Thread(
             target=console_loop,
             args=(ble, mesh, scheduler, stop_event, loop),
+            kwargs={"on_forward_change": _remember_mode},
             daemon=True,
         )
         console_thread.start()
@@ -3814,6 +4422,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="two-way sync: forward new messages immediately both ways")
     p.add_argument("--no-full-sync", action="store_true",
                    help="disable two-way sync even if config enables it")
+    p.add_argument("--bitchat-forward", choices=("bound", "custom", "all"),
+                   metavar="MODE",
+                   help="what may be sent from Bitchat to LoRa: 'bound' "
+                        "(only the bound phone), 'custom' (list picked in the "
+                        "console), 'all' (everything that reaches the phone)")
     p.add_argument("--name", help="bridge nickname in Bitchat")
     p.add_argument("--channel", type=int, metavar="N",
                    help="default Meshtastic channel index for Bitchat messages")
@@ -3864,6 +4477,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         full_sync = True
     if args.no_full_sync:
         full_sync = False
+
+    # What may leave for LoRa from Bitchat.  The mode is remembered in the
+    # config file (edited by hand or by the console key "b"); the list of
+    # extra phones is never written there, because a person who opens the
+    # phone instead of the chat must not be able to widen it silently.
+    forward_mode = str(cfg.get("bitchat_forward") or "bound").strip().lower()
+    if forward_mode not in ("bound", "custom", "all"):
+        forward_mode = "bound"
+    if args.bitchat_forward:
+        forward_mode = args.bitchat_forward
 
     chat_target = parse_chat(args.chat) if args.chat else chat_from_config(cfg)
     if args.channel is not None:
@@ -3954,7 +4577,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                             console=console_enabled,
                             bitchat_target=bitchat_target,
                             full_sync=full_sync,
-                            bitchat_peer=bitchat_peer))
+                            bitchat_peer=bitchat_peer,
+                            forward_mode=forward_mode,
+                            config_path=args.config))
         except KeyboardInterrupt:
             print("\nОстановлено.")
             return 0

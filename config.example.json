@@ -7,6 +7,7 @@
   "ble_scan_seconds": 3.0,
   "bitchat_target": "",
   "full_sync": false,
+  "bitchat_forward": "bound",
   "history_limit": 100,
   "lora_send_interval": 10.0,
   "lora_stale_seconds": 1800,
