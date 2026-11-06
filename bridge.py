@@ -641,21 +641,60 @@ async def _scan_lan(port: int = MESHTASTIC_TCP_PORT,
     return [h for h in found if h]
 
 
-def _verify_hosts(hosts: List[str], port: int) -> List[tuple]:
-    """Identify candidate hosts in parallel; keep only real Meshtastic radios."""
+async def _scan_lan_long(port: int = MESHTASTIC_TCP_PORT,
+                         networks: Optional[List[dict]] = None) -> List[str]:
+    """Slow pass for radios that answer late.
+
+    Some ESP32 builds answer the very first connection several seconds after
+    the request, so the fast sweep misses them.  This pass asks every host
+    with a longer timeout, using a few connections at a time, so a busy
+    network does not slow it down.
+    """
+    hosts: List[str] = []
+    for entry in (connected_networks() if networks is None else networks):
+        hosts.extend(str(host) for host in entry["network"].hosts())
+    hosts = list(dict.fromkeys(hosts))
     if not hosts:
         return []
+
+    sem = asyncio.Semaphore(48)
+
+    async def probe(host: str) -> Optional[str]:
+        async with sem:
+            return host if await _port_open(host, port, timeout=2.0) else None
+
+    found = await asyncio.gather(*(probe(h) for h in hosts))
+    return [h for h in found if h]
+
+
+def _verify_hosts(hosts: List[str], port: int, attempts: int = 3) -> List[tuple]:
+    """Identify candidate hosts in parallel; keep only real Meshtastic radios.
+
+    A radio wakes slowly from time to time and stays silent for the first
+    request.  It is asked again a few times before the scan gives up on it,
+    so one unlucky moment does not hide a working module.
+    """
+    if not hosts:
+        return []
+    found: List[tuple] = []
+    done: set = set()
     with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as pool:
-        futures = {pool.submit(_probe_tcp_name, host, 2.0, port): host
-                   for host in hosts}
-        found = []
-        for future in futures:
-            try:
-                name = future.result()
-            except Exception:  # noqa: BLE001
-                name = None
-            if name is not None:
-                found.append((futures[future], name))
+        for attempt in range(attempts):
+            pending = [h for h in hosts if h not in done]
+            if not pending:
+                break
+            if attempt:
+                time.sleep(0.5)
+            futures = {pool.submit(_probe_tcp_name, host, 2.0, port): host
+                       for host in pending}
+            for future, host in futures.items():
+                try:
+                    name = future.result()
+                except Exception:  # noqa: BLE001
+                    name = None
+                if name is not None:
+                    found.append((host, name))
+                    done.add(host)
     return found
 
 
@@ -826,6 +865,38 @@ def _mdns_host(port: int, timeout: float = 1.2) -> Optional[str]:
     return result.get("addr")
 
 
+async def _discover_tcp_devices(port: int = MESHTASTIC_TCP_PORT,
+                                networks: Optional[List[dict]] = None,
+                                quiet: bool = False) -> List[dict]:
+    """All Meshtastic radios reachable over TCP in the connected networks.
+
+    One fast sweep finds radios that answer immediately.  When fewer than two
+    radios are found, a second sweep with a longer timeout follows: a radio
+    that was busy at that moment (or answers its first request slowly) is
+    asked again instead of silently missing from the list.
+    """
+    def say(*args) -> None:
+        if not quiet:
+            print(*args)
+
+    say(f"Ищу Meshtastic с открытым портом {port} в этих сетях...")
+    hosts = await _scan_lan(port, networks)
+    verified = _verify_hosts(hosts, port) if hosts else []
+    if len(verified) < 2:
+        say("  перепроверяю с большим терпением...")
+        slow = await _scan_lan_long(port, networks)
+        extra = [h for h in slow if h not in {v[0] for v in verified}]
+        if extra:
+            verified.extend(_verify_hosts(extra, port))
+
+    devices: List[dict] = []
+    for host, name in verified:
+        devices.append({"kind": "tcp", "target": host, "port": port,
+                        "label": f"{name} — {host}:{port} (Wi-Fi)"})
+        say(f"  ок: {name} — {host}:{port}")
+    return devices
+
+
 def scan_wifi_devices(port: int = MESHTASTIC_TCP_PORT) -> List[dict]:
     networks = connected_networks()
     if not networks:
@@ -849,27 +920,11 @@ def scan_wifi_devices(port: int = MESHTASTIC_TCP_PORT) -> List[dict]:
     mdns_thread = threading.Thread(target=_mdns, daemon=True)
     mdns_thread.start()
 
-    print(f"Ищу Meshtastic с открытым портом {port} в этих сетях...")
-    hosts = asyncio.run(_scan_lan(port, networks))
-
-    if mdns_result.get("addr") and mdns_result["addr"] not in hosts:
-        hosts.append(mdns_result["addr"])
-
-    if not hosts:
-        print(f"Meshtastic с портом {port} не найден.")
-        return []
-
-    if len(hosts) == 1:
-        print(f"  проверяю {hosts[0]}...")
-    else:
-        print(f"  открытый порт найден у {len(hosts)} устройств, "
-              "проверяю параллельно...")
-
-    devices = []
-    for host, name in _verify_hosts(hosts, port):
-        devices.append({"kind": "tcp", "target": host, "port": port,
-                        "label": f"{name} — {host}:{port} (Wi-Fi)"})
-        print(f"  ок: {name} — {host}:{port}")
+    devices = asyncio.run(_discover_tcp_devices(port, networks))
+    if not devices and mdns_result.get("addr"):
+        devices = asyncio.run(_discover_tcp_devices(
+            port, [{"network": ipaddress.IPv4Network(
+                f"{mdns_result['addr']}/32", strict=False)}]))
 
     if not devices:
         print(f"Meshtastic с портом {port} не найден.")
