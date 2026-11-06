@@ -232,38 +232,173 @@ def _lock_process_memory() -> bool:
         return False
 
 
-def _empty_pagefile_on_exit() -> None:
-    """Make Windows zero the pagefile at the next boot.
+# --- Protection of the running process ------------------------------------
+# Message text lives in this process only (encrypted) for the few seconds
+# before it is delivered.  What is left to protect is that short window from
+# a tool that copies memory out: a memory dump, a debugger, or a crash dump
+# written by Windows itself.
+#
+#   * the crash-dump path (Windows Error Reporting) is switched off for the
+#     interpreter, so a crash leaves no readable copy on disk;
+#   * the access list of the process is narrowed so that only the user who
+#     runs the bridge and administrators can read its memory.
+#
+# All of it is best effort and only touches this process on Windows: on any
+# other system the functions return at once, and a failure (no rights, old
+# version) leaves the process exactly as it was.  Nothing here touches the
+# radio or the console.
+#
+# PROCESS_ALL_ACCESS without the two rights a memory dump needs.
+_PROCESS_RIGHTS = 0x1F0F6F
 
-    A message that was wiped from RAM still has to be erased from swapped
-    pages that may hold an older copy.  The flag is a machine-wide policy
-    that Windows applies at shutdown; it is set once and never read back.
+
+def _keep_dumps_off_memory() -> bool:
+    """Switch off local crash dumps for the Python executable.
+
+    Windows Error Reporting can write a full copy of a crashing process to
+    disk on its own.  This turns that behaviour off for the interpreter that
+    runs the bridge, so even an unexpected crash leaves no file holding
+    message text.
+
+    The setting lives in HKLM and needs administrator rights; the bridge is
+    normally started as a plain user, so the call fails and that is expected:
+    the process-level protection next to it does not depend on it.
     """
     if os.name != "nt":
-        return
+        return False
+    try:
+        import winreg  # noqa: PLC0415  (Windows only, imported on demand)
+
+        # WER matches the image name, e.g. "python.exe".
+        path = ("SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\"
+                f"LocalDumps\\{os.path.basename(sys.executable)}")
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, path, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            # DumpType 0 means "write no dump at all".
+            winreg.SetValueEx(key, "DumpType", 0, winreg.REG_DWORD, 0)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _deny_debug() -> bool:
+    """Make the running bridge refuse dumps and debuggers.
+
+    One change, limited to this process: its access list keeps full control
+    for the user who started the bridge and for administrators only.  Every
+    other account loses the rights a dump needs (read memory, duplicate
+    handles), and a limited account cannot open the process for memory
+    access even when it runs a dump tool.  No deny entries are involved, so
+    the bridge itself and its owner keep every right they had (stop, read
+    status, close), and nothing changes outside this process.
+
+    Best effort: the call is attempted once at start-up, a failure (old or
+    unusual system) is ignored, and the bridge keeps running with its
+    encrypted buffer as the main protection.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        return _restrict_process_readers()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _current_user_sid() -> Optional[str]:
+    """The text form of the SID of the user running the bridge."""
     try:
         advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-        advapi.RegOpenKeyExW.argtypes = [
-            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32,
-            ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
-        advapi.RegSetValueExW.argtypes = [
-            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32,
-            ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32]
-        advapi.RegCloseKey.argtypes = [ctypes.c_void_p]
-        hive = ctypes.c_void_p()
-        if advapi.RegOpenKeyExW(ctypes.c_void_p(0x80000002),  # HKLM
-                                "SYSTEM\\CurrentControlSet\\Control\\"
-                                "Session Manager\\Memory Management",
-                                0, 0x0002, ctypes.byref(hive)) != 0:
-            return
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.LocalFree.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        advapi.OpenProcessToken.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+        advapi.OpenProcessToken.restype = ctypes.c_int
+        advapi.GetTokenInformation.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32)]
+        advapi.GetTokenInformation.restype = ctypes.c_int
+        advapi.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+        advapi.ConvertSidToStringSidW.restype = ctypes.c_int
+
+        token = ctypes.c_void_p()
+        # TOKEN_QUERY is enough to read the user SID.
+        if not advapi.OpenProcessToken(k32.GetCurrentProcess(), 0x0008,
+                                       ctypes.byref(token)):
+            return None
         try:
-            zero = ctypes.c_ulong(1)
-            advapi.RegSetValueExW(hive, "ClearPageFileAtShutdown", 0, 4,
-                                  ctypes.byref(zero), 4)
+            need = ctypes.c_uint32()
+            advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(need))
+            if not need.value:
+                return None
+            # TokenUser returns a TOKEN_USER whose first field is the SID.
+            buf = ctypes.create_string_buffer(need.value)
+            if not advapi.GetTokenInformation(token, 1, buf, need.value,
+                                              ctypes.byref(need)):
+                return None
+            sid_ptr = ctypes.c_void_p.from_buffer(buf).value
+            text = ctypes.c_wchar_p()
+            if not advapi.ConvertSidToStringSidW(ctypes.c_void_p(sid_ptr),
+                                                 ctypes.byref(text)):
+                return None
+            value = text.value
+            k32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+            return value
         finally:
-            advapi.RegCloseKey(hive)
+            k32.CloseHandle(token)
     except Exception:  # noqa: BLE001
-        pass
+        return None
+
+
+def _set_process_dacl(sddl: str) -> bool:
+    """Apply *sddl* as the access list of the current process."""
+    try:
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32)]
+        advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = \
+            ctypes.c_int
+        ntdll.NtSetSecurityObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+        ntdll.NtSetSecurityObject.restype = ctypes.c_uint32
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.LocalFree.argtypes = [ctypes.c_void_p]
+
+        sd = ctypes.c_void_p()
+        size = ctypes.c_uint32()
+        if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, 1, ctypes.byref(sd), ctypes.byref(size)):
+            return False
+        try:
+            # Pseudo-handle -1 means "this process"; 0x4 asks for the DACL
+            # only.  0 (STATUS_SUCCESS) means the list was applied.
+            rc = ntdll.NtSetSecurityObject(ctypes.c_void_p(-1), 0x4, sd)
+            return rc == 0
+        finally:
+            k32.LocalFree(sd)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _restrict_process_readers() -> bool:
+    """Narrow the access list of the bridge process.
+
+    Full control stays with the user who started the bridge (Windows gives
+    it that anyway).  No deny entries are involved: they would make the
+    process unreadable even for the user who has to stop it.
+    """
+    try:
+        sid = _current_user_sid()
+        if not sid:
+            return False
+        return _set_process_dacl(
+            f"O:{sid}G:{sid}D:(A;;0x{_PROCESS_RIGHTS:X};;;{sid})")
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _buffer_key() -> bytes:
@@ -302,14 +437,16 @@ def wipe_sensitive_memory() -> None:
 
     Called after every delivery and when the process stops, so a waiting
     message lives in the encrypted buffer only for the time it is needed.
-    The next message gets a fresh key.
+    The next message gets a fresh key.  The key is zeroed where it lies
+    before its reference is dropped, so a copy of the process memory taken
+    afterwards finds no usable key next to the sealed bodies.
     """
     global _BUFFER_KEY
     if _BUFFER_KEY is not None:
-        # Overwrite the key bytes in place before dropping the reference.
-        buf = ctypes.create_string_buffer(bytes(_BUFFER_KEY), len(_BUFFER_KEY))
-        ctypes.memset(buf, 0, len(_BUFFER_KEY))
-        del buf
+        key = bytearray(_BUFFER_KEY)
+        for index in range(len(key)):
+            key[index] = 0
+        del key
         _BUFFER_KEY = None
     gc.collect()
 
@@ -3589,10 +3726,13 @@ async def run(transport: Optional[dict], name: str, scan_seconds: float,
               full_sync: bool = False,
               bitchat_peer: Optional[str] = None) -> int:
     loop = asyncio.get_running_loop()
-    # Keep message buffers in RAM only: out of the pagefile and zeroed at the
-    # next boot.  Both calls are best effort and never stop the bridge.
+    # Harden the process before any message can arrive: no crash dumps for
+    # the interpreter, no debugger or dump tool attached to this process,
+    # and message buffers kept in RAM (out of the pagefile).  All of it is
+    # best effort and never stops the bridge.
+    await asyncio.to_thread(_keep_dumps_off_memory)
+    await asyncio.to_thread(_deny_debug)
     await asyncio.to_thread(_lock_process_memory)
-    await asyncio.to_thread(_empty_pagefile_on_exit)
 
     ble = BitchatBLEHandler(loop, name, scan_seconds, history_limit,
                             target_address=bitchat_target,
