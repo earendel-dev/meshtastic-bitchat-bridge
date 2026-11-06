@@ -64,6 +64,10 @@ except Exception:  # pragma: no cover
     lz4 = None  # type: ignore
 
 APP_NAME = "mesh-bitchat-bridge"
+# Pre-release numbering: 0.1.0-alpha.1 is the first downloadable build; the
+# engineering number after '+' is bumped on every published file.
+APP_VERSION = "0.1.0-alpha.1+2026.11.07"
+VERSION = "0.1.0-alpha.1"
 
 # --- Bitchat protocol (BitFoundation / MessageType.swift) ---
 BITCHAT_SERVICE_UUID = "f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c"  # mainnet
@@ -1618,6 +1622,9 @@ class MeshtasticHandler:
         self._reconnect_delay = 5
         self._max_reconnect_delay = 30
         self._reconnecting = False
+        # The reconnect retry as a real task of this loop, so stop() can end
+        # it instead of leaving a pending task behind.
+        self._reconnect_task: Optional[asyncio.Task] = None
         # Outgoing Bitchat -> LoRa queue.  Entries are dicts with a timestamp
         # so old automatic messages can be dropped instead of flooding LoRa.
         self.pending_texts: deque = deque(maxlen=MAX_QUEUE)
@@ -1810,7 +1817,7 @@ class MeshtasticHandler:
         if self._stopping or self._reconnecting or not self.loop.is_running():
             return
         self._reconnecting = True
-        asyncio.run_coroutine_threadsafe(self._reconnect_loop(), self.loop)
+        self._reconnect_task = self.loop.create_task(self._reconnect_loop())
 
     async def _reconnect_loop(self) -> None:
         delay = self._reconnect_delay
@@ -1823,6 +1830,9 @@ class MeshtasticHandler:
                     log.info("Meshtastic снова на связи")
                     return
                 delay = min(delay * 2, self._max_reconnect_delay)
+        except asyncio.CancelledError:
+            # stop() closes the interface; there is nothing to retry.
+            pass
         finally:
             self._reconnecting = False
 
@@ -1993,6 +2003,10 @@ class MeshtasticHandler:
             }
             self.history_lora.append(entry)
             collapse_duplicate_entries(self.history_lora)
+            self._gui_last_rx = time.time()
+            self._gui_latest = {"direction": "rx", "author": sender,
+                                "kind": "из LoRa", "chars": len(text),
+                                "at": self._gui_last_rx}
             if self.ble_handler and self.loop.is_running():
                 asyncio.run_coroutine_threadsafe(
                     self.ble_handler.deliver_history(entry), self.loop
@@ -2100,13 +2114,15 @@ class MeshtasticHandler:
             if destination is not None:
                 kwargs["destinationId"] = destination
             self.interface.sendText(text, **kwargs)
-            self._recent_sent.append(
-                (hashlib.sha256(text.encode()).digest(), time.time()))
-            return True
         except Exception as exc:  # noqa: BLE001
             log.error("Отправка в LoRa не удалась: %s", exc)
             self.on_connection_lost()
             return False
+        # Only a successful send goes into the echo filter: a failed attempt
+        # must not suppress the same text when it is really received later.
+        self._recent_sent.append(
+            (hashlib.sha256(text.encode()).digest(), time.time()))
+        return True
 
     async def flush_texts(self) -> None:
         """Send queued messages one-by-one with air-time spacing."""
@@ -2124,6 +2140,10 @@ class MeshtasticHandler:
                     self.pending_texts.popleft()
                     say("[LoRa] устаревшее сообщение пропущено "
                         "(содержимое не выводится)")
+                    self._gui_dropped += 1
+                    self._gui_latest = {"direction": "drop", "author": "",
+                                        "kind": "устарело", "chars": 0,
+                                        "at": time.time()}
                     hist = entry.get("history")
                     if isinstance(hist, dict):
                         hist["queued_lora"] = False
@@ -2143,6 +2163,15 @@ class MeshtasticHandler:
                 hist = entry.get("history")
                 if isinstance(hist, dict):
                     hist["sent_lora"] = True
+                self._gui_sent += 1
+                self._gui_last_tx = self._last_send_at
+                self._gui_latest = {
+                    "direction": "tx",
+                    "author": (hist or {}).get("name", "") if isinstance(hist, dict) else "",
+                    "kind": "в LoRa",
+                    "chars": len(open_text(entry.get("sealed"))),
+                    "at": self._gui_last_tx,
+                }
             if sent:
                 say(f"[LoRa] отправлено из очереди: {sent} "
                     f"(осталось {len(self.pending_texts)})")
@@ -2170,6 +2199,15 @@ class MeshtasticHandler:
 
     def stop(self) -> None:
         self._stopping = True
+        task = self._reconnect_task
+        if task is not None and not task.done():
+            loop = self.loop
+            if loop.is_running() and not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    pass
+        self._reconnect_task = None
         self._cleanup_interface()
 
 
@@ -2297,6 +2335,13 @@ class BitchatBLEHandler:
         # (digests only, never the text).
         self._recent_outgoing: deque = deque(maxlen=200)
         self._delivery_lock = asyncio.Lock()
+        # Indicators for a user interface (gui/).  Only counters, a kind and
+        # a name: never the text of a message.
+        self._gui_latest: Optional[dict] = None
+        self._gui_sent = 0
+        self._gui_dropped = 0
+        self._gui_last_rx = 0.0
+        self._gui_last_tx = 0.0
         self._announced = False
 
         # PeerID in Bitchat = sha256(Noise public key)[:8] (see PeerID.swift)
@@ -2671,6 +2716,10 @@ class BitchatBLEHandler:
         self.history_bitchat.append(entry)
         collapse_duplicate_entries(self.history_bitchat)
         log.info("(BLE -> LoRa буфер) %s: %d символов", clean, len(body_text))
+        self._gui_last_rx = time.time()
+        self._gui_latest = {"direction": "rx", "author": clean,
+                            "kind": "сообщение", "chars": len(body_text),
+                            "at": self._gui_last_rx}
         if self.full_sync and self.meshtastic and self.may_forward(peer_key):
             # Full two-way mode: forward at once, still via the rate-limited
             # LoRa queue so the air is not flooded.
@@ -3442,6 +3491,104 @@ class BitchatBLEHandler:
         if client is not None:
             with contextlib.suppress(Exception):
                 asyncio.get_running_loop().create_task(client.disconnect())
+
+    async def _drop_link(self, addr: str, force: bool = False) -> None:
+        client = self.connected.pop(addr, None)
+        self._chars.pop(addr, None)
+        self._last_seen.pop(addr, None)
+        self._opened_at.pop(addr, None)
+        self._last_keepalive.pop(addr, None)
+        self.last_nudge.pop(addr, None)
+        self.connecting.discard(addr)
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+
+    # ------------------------------------------------------------ GUI hooks
+    def get_stats(self) -> dict:
+        """Live counters for a user interface; no message text, no addresses.
+
+        Called from the GUI thread while the engine runs in its own thread,
+        hence: every container is iterated over a copy and nothing is
+        mutated here.
+        """
+        buffered = 0
+        blocked = 0
+        for entry in list(self.history_bitchat):
+            if entry.get("sent_lora") or entry.get("queued_lora"):
+                continue
+            if self.may_forward(entry.get("peer")):
+                buffered += 1
+            else:
+                blocked += 1
+        peers = []
+        for peer in _known_peers(self):
+            peers.append({
+                "id": peer,
+                "label": _peer_label(self, peer),
+                "fingerprint": self.peer_fingerprints.get(peer, ""),
+                "bound": peer == self.bound_peer,
+            })
+        label = ""
+        fingerprint = ""
+        if self.bound_peer:
+            label = self.peer_nicknames.get(self.bound_peer, "") or \
+                "@" + self.bound_peer[:4]
+            fingerprint = self.peer_fingerprints.get(self.bound_peer, "")
+        return {
+            "forward_mode": self.forward_mode,
+            "forward_name": _forward_mode_name(self),
+            "sources": sorted(self.bitchat_sources),
+            "replied": sorted(self.bitchat_replied),
+            "full_sync": bool(self.full_sync),
+            "bound": bool(self.bound_peer),
+            "bound_label": label,
+            "bound_fingerprint": fingerprint,
+            "connected": list(self.connected),
+            "peers": peers,
+            "queued_to_lora": buffered,
+            "blocked": blocked,
+            "_latest": getattr(self, "_gui_latest", None),
+            "_sent": getattr(self, "_gui_sent", 0),
+            "_dropped": getattr(self, "_gui_dropped", 0),
+            "_last_rx": getattr(self, "_gui_last_rx", 0.0),
+            "_last_tx": getattr(self, "_gui_last_tx", 0.0),
+        }
+
+    def set_forward_mode_gui(self, mode: str,
+                             sources: Optional[set] = None) -> bool:
+        """Switch the forwarding mode from a user interface.
+
+        The console asks for two confirmations before it calls this; the GUI
+        does the same and passes ``sources`` for ``custom``.
+        """
+        if mode not in ("bound", "custom", "all", "replies"):
+            return False
+        if mode == "custom":
+            chosen = {p for p in (sources or set())
+                      if p and p != self.bound_peer}
+            if not chosen:
+                return False
+            self.bitchat_sources = chosen
+        self.set_forward_mode(mode)
+        return True
+
+    def reset_binding_gui(self) -> None:
+        """Let the bound phone go without stopping the bridge.
+
+        The scanner keeps running, so the next phone that announces can be
+        bound; the confirmations are asked again.  Must run on the loop.
+        """
+        self.bound_peer = None
+        self.target_peer = None
+        self.private_confirmed = False
+        self.bitchat_sources = set()
+        self.bitchat_replied = set()
+        self._last_public_sender = None
+        self.set_forward_mode("bound")
+        for addr in list(self.connected):
+            asyncio.get_running_loop().create_task(
+                self._drop_link(addr, force=True))
 
     async def stop(self) -> None:
         self._stopping = True
@@ -4559,7 +4706,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     truncate_seconds = float(cfg.get("log_truncate_seconds", 300) or 300)
     setup_logging(args.debug, cfg.get("log_file", "bridge.log"),
                   quiet=quiet, truncate_seconds=truncate_seconds)
-    log.info("Запуск %s", APP_NAME)
+    log.info("Запуск %s %s", APP_NAME, APP_VERSION)
 
     name = args.name or cfg.get("name", "MeshBridge")
     scan_seconds = float(cfg.get("ble_scan_seconds", 3.0))

@@ -10,6 +10,9 @@ config.json
 bridge.log
 *.log
 
+# Build output of gui.spec (the exe is published as a release asset)
+var/
+
 # Private developer notes — local only, must never reach the public repo
 DEVELOPMENT.md
 
