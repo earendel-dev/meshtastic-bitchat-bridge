@@ -11,19 +11,23 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from typing import List, Optional
 
+import bridge
 from PySide6.QtCore import QObject, QSize, QTimer, Qt, Signal
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMainWindow, QPushButton,
                                QScrollArea, QSizePolicy, QTabWidget,
                                QVBoxLayout, QWidget)
 
 from .core import events as ev
+from .core.search import Finder
 from .core.session import BridgeSession, EngineConfig
 from .pages.activity import LogPage
 from .pages.base import Page
 from .pages.connections import ConnectionsPage
+from .pages.devices import DevicesPage
 from .pages.forward import ForwardPage
 from .pages.overview import OverviewPage
 from .pages.sync import SyncPage
@@ -48,15 +52,23 @@ class EventRelay(QObject):
     heartbeat = Signal(float)
 
 
+def _default_finder(parent: QObject) -> Finder:
+    """The real searcher; ``gui.main`` passes its own so tests can fake it."""
+    from .core.search import DeviceSearch
+    return DeviceSearch(parent)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, cfg: EngineConfig, autostart: bool = True,
-                 parent: Optional[QWidget] = None):
+                 parent: Optional[QWidget] = None,
+                 finder: Optional[Finder] = None):
         super().__init__(parent)
         self.setWindowTitle("Мост Meshtastic ↔ Bitchat")
         self.setMinimumSize(520, 480)
         self.resize(980, 760)
         self.setStyleSheet(style_sheet())
 
+        self.finder = finder if finder is not None else _default_finder(self)
         self.session = self._make_session(cfg)
         self._last_beat = 0.0
         self._last_forward = 0.0
@@ -75,10 +87,12 @@ class MainWindow(QMainWindow):
         self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
         self.tabs.setDocumentMode(True)
         self.tabs.setIconSize(QSize(16, 16))
-        # Pictures instead of words in the strip (the five Russian titles
-        # need more width than a laptop window usually has); the full name
-        # is the tab's tooltip and the page's own heading.
+        # Pictures instead of words in the strip (the Russian titles need
+        # more width than a laptop window usually has); the full name is the
+        # tab's tooltip and the page's own heading.
         for page, title, icon in (
+                (DevicesPage(self.session), "Устройства: радио, чат, телефон",
+                 "⌂"),
                 (OverviewPage(self.session), "Обзор", "◉"),
                 (ForwardPage(self.session),
                  "Пересылка Bitchat → LoRa", "➜"),
@@ -93,6 +107,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.tabs, 1)
         root.addWidget(self._build_footer())
         self.setCentralWidget(central)
+        self._wire_devices()
 
         self._idle_timer = QTimer(self)
         self._idle_timer.setInterval(300)
@@ -104,6 +119,99 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.start_bridge)
 
     # --------------------------------------------------------- engine glue
+    def _wire_devices(self) -> None:
+        """Connect the device page to the searcher and to the engine.
+
+        The page only asks; the window owns the searcher (threads) and the
+        engine session, so a restart keeps working without touching pages.
+        """
+        self.devices = next((page for page in self.pages
+                            if isinstance(page, DevicesPage)), None)
+        if self.devices is None:
+            return
+        self.devices.attach(self.finder)
+        self.devices.config_path = (self._bridge.cfg.config_path
+                                    or "config.json")
+        cfg = self._bridge.cfg
+        # What the page shows before anything is searched: the radio and chat
+        # the config file gives, exactly what the old window used silently.
+        if cfg.transport:
+            self.devices.set_transport(cfg.transport)
+        if cfg.chat_target:
+            self.devices.set_chat(cfg.chat_target)
+        self.devices.start_requested.connect(self._start_from_devices)
+        self.devices.chat_picked.connect(self._devices_chat)
+        self.devices.stop_requested.connect(self.stop_bridge)
+        self.finder.radios.connect(self.devices.on_radios)
+        self.finder.radios_failed.connect(self.devices.on_radios_failed)
+        self.finder.phones.connect(self.devices.on_phones)
+        self.finder.chats.connect(self.devices.on_chats)
+        self.finder.failed.connect(self.devices.on_failed)
+        self._dev_watch = QTimer(self)
+        self._dev_watch.setInterval(200)
+        self._dev_watch.timeout.connect(self._sync_devices)
+        self._dev_watch.start()
+
+    def _start_from_devices(self) -> None:
+        """Start the bridge on what the device page has chosen."""
+        if self.devices is None:
+            return
+        transport = self.devices.transport
+        if not transport:
+            return
+        self.start_bridge(transport=transport, chat=self.devices.chat,
+                          phone=self.devices.phone)
+
+    def _sync_devices(self) -> None:
+        """Mirror the engine's state on the device page (prompt and button).
+
+        The page cannot read the engine itself: the session is replaced on
+        every start, so the window tells it what to show.
+        """
+        if self.devices is None:
+            return
+        running = bool(self._bridge.alive)
+        if running:
+            self.devices.show_prompt(self.devices.prompt_for_engine(
+                self._bridge))
+            self.devices.set_busy(True)
+            return
+        if not (self.devices.shows_engine or self.devices.is_busy):
+            # Nothing has been started for this page yet: its own lines stay.
+            return
+        self.devices.show_prompt(self.devices.prompt_when_stopped())
+        self.devices.set_engine_state("stopped")
+        self.devices.set_busy(False)
+
+    # ------------------------------------------------------------- checks
+    def _devices_chat(self, chat) -> None:
+        """The owner moved the chat selector: check the chat with this radio.
+
+        A direct chat needs a node that exists on that radio; a channel must
+        be enabled there.  Until now this was checked by the radio itself;
+        the page asks the same question and puts the answer in the status
+        line, while the engine keeps making its own final decision.
+        """
+        if not chat or not self.devices.transport or self.session is None:
+            return
+        session = self.session
+        # The engine is asked only when it is running; while it is stopped
+        # the page says so and the check happens at start.
+        if not getattr(session, "ble", None) or \
+                not getattr(session, "mesh", None):
+            self.devices.show_check("Радио ещё не на связи: проверка будет "
+                                    "при запуске моста.")
+            return
+        try:
+            decided = session.check_chat(chat)
+        except Exception as exc:  # noqa: BLE001
+            self.devices.show_check(f"Беседа не проверена: {exc}")
+            return
+        self.devices.show_check(decided)
+
+    # Note: the page's chat signal is wired to the window only, never to
+    # the page's own set_chat — the page has no engine to ask.
+
     def _make_session(self, cfg: EngineConfig) -> EngineSession:
         """One engine thread + one action layer for every page."""
         relay = EventRelay(self)
@@ -224,10 +332,36 @@ class MainWindow(QMainWindow):
         return area
 
     # ------------------------------------------------------------ controls
-    def start_bridge(self) -> None:
+    def start_bridge(self, transport: Optional[dict] = None,
+                     chat: Optional[dict] = None,
+                     phone: Optional[dict] = None) -> None:
+        """Start the engine.
+
+        With no arguments it uses the config file, as old builds did.  The
+        device page passes the radio, the chat and the confirmed phone it
+        collected, which is what the console menu does before ``bridge.run``.
+        """
         if self._bridge.alive:
             return
         cfg = self._bridge.cfg
+        self._own_device_choice = False
+        if transport or chat or phone:
+            # The choice is made here, by the owner: the engine may bind the
+            # phone and start without asking again.
+            self._own_device_choice = True
+            cfg.ready = True
+            if chat:
+                cfg.chat_target = dict(chat)
+                cfg.channel = int(chat.get("index", 0)) \
+                    if chat.get("kind") == "channel" else cfg.channel
+            if phone and phone.get("peer"):
+                cfg.bitchat_peer = str(phone["peer"]).lower()
+                cfg.bitchat_key = phone.get("signing_pub")
+                cfg.bitchat_nickname = phone.get("nickname") or ""
+                cfg.bitchat_fingerprint = phone.get("fingerprint") or ""
+            if transport:
+                bridge.save_transport(cfg.config_path, transport)
+                cfg.transport = dict(transport)
         self.session = self._make_session(cfg)
         for page in self.pages:
             page.set_session(self.session)
@@ -246,6 +380,10 @@ class MainWindow(QMainWindow):
         # in its own stop path, so wait for that path to finish.
         if self._bridge.alive:
             self._bridge.shutdown(timeout=12.0)
+        # Searches run on their own threads; they must end before Qt takes
+        # the widgets away, or a late result would be delivered to nothing.
+        with contextlib.suppress(Exception):
+            self.finder.shutdown()
         event.accept()
 
     # --------------------------------------------------------------- state

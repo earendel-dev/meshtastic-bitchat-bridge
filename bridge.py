@@ -224,6 +224,16 @@ def peer_fingerprint(signing_pub: bytes) -> str:
     return "-".join(digest[i:i + 4] for i in range(0, 16, 4))
 
 
+def _loop(name: str = "loop"):
+    """A private event loop for a one-off connection.
+
+    ``find_chats`` runs on its own thread and builds a handler the way
+    ``bridge.run`` does.  Such a loop is created, used for one connection and
+    closed; it is never closed again later (``asyncio.run`` on the same
+    thread would otherwise shut down a loop that was closed here).
+    """
+    return asyncio.new_event_loop()
+
 # --- Volatile message buffer ----------------------------------------------
 # Messages that wait for delivery or a free radio slot are held in RAM only,
 # encrypted with an ephemeral key generated at start-up.  Nothing reaches the
@@ -1180,8 +1190,12 @@ def scan_wifi_devices(port: int = MESHTASTIC_TCP_PORT) -> List[dict]:
     return devices
 
 
-def scan_ble_devices(seconds: float = 8.0) -> List[dict]:
-    print(f"Сканирую Bluetooth {seconds:.0f} c...")
+def scan_ble_devices(seconds: float = 8.0, quiet: bool = False) -> List[dict]:
+    def say(*args) -> None:
+        if not quiet:
+            print(*args)
+
+    say(f"Сканирую Bluetooth {seconds:.0f} c...")
 
     async def _scan():
         devs = await BleakScanner.discover(timeout=seconds, return_adv=True)
@@ -1197,12 +1211,12 @@ def scan_ble_devices(seconds: float = 8.0) -> List[dict]:
     try:
         found = asyncio.run(_scan())
     except Exception as exc:  # noqa: BLE001
-        print(f"Bluetooth недоступен: {exc}")
+        say(f"Bluetooth недоступен: {exc}")
         return []
 
     if not found:
-        print("Meshtastic по Bluetooth не найден "
-              "(на ESP32 BLE выключается, когда включён Wi-Fi).")
+        say("Meshtastic по Bluetooth не найден "
+            "(на ESP32 BLE выключается, когда включён Wi-Fi).")
     return found
 
 
@@ -1576,16 +1590,20 @@ def choose_bitchat_peer(seconds: float = 8.0) -> Optional[dict]:
         print("Нет такого номера.")
 
 
-def scan_serial_devices() -> List[dict]:
+def scan_serial_devices(quiet: bool = False) -> List[dict]:
+    def say(*args) -> None:
+        if not quiet:
+            print(*args)
+
     try:
         import serial.tools.list_ports as list_ports
     except Exception as exc:  # noqa: BLE001
-        print(f"pyserial недоступен: {exc}")
+        say(f"pyserial недоступен: {exc}")
         return []
 
     ports = list(list_ports.comports())
     if not ports:
-        print("COM-портов не найдено.")
+        say("COM-портов не найдено.")
         return []
 
     devices = []
@@ -3573,6 +3591,31 @@ class BitchatBLEHandler:
         self.set_forward_mode(mode)
         return True
 
+    def bind_peer(self, peer: str,
+                  nickname: Optional[str] = None,
+                  fingerprint: Optional[str] = None,
+                  signing_pub: Optional[bytes] = None) -> None:
+        """Bind the phone that the owner confirmed in the window.
+
+        The console stores the peer id after two ``yes`` and the scanner
+        accepts only that peer; the window hands the same values in here
+        instead.  The BLE address is not part of the binding: iOS rotates
+        it, so the identity is the peer id plus the announced key.
+        """
+        peer = (peer or "").strip().lower()
+        if not peer:
+            return
+        self.bound_peer = peer
+        self.target_peer = peer
+        if nickname:
+            self.peer_nicknames[peer] = nickname
+        if signing_pub:
+            self.peer_keys[peer] = signing_pub
+            self.peer_fingerprints[peer] = (fingerprint
+                                            or peer_fingerprint(signing_pub))
+        elif fingerprint:
+            self.peer_fingerprints[peer] = fingerprint
+
     def reset_binding_gui(self) -> None:
         """Let the bound phone go without stopping the bridge.
 
@@ -3615,6 +3658,53 @@ class BitchatBLEHandler:
 # --------------------------------------------------------------------------
 # Interactive menu
 # --------------------------------------------------------------------------
+def scan_wifi_devices_quiet(port: int = MESHTASTIC_TCP_PORT) -> List[dict]:
+    """Same search as ``scan_wifi_devices``, but without printing.
+
+    The window has no console to print to (a frozen windowed build has no
+    stdout at all), so it uses this form and shows the outcome in its own
+    list.  The console keeps the printing one.
+    """
+    networks = connected_networks()
+    if not networks:
+        return []
+    mdns_result: dict = {}
+
+    def _mdns() -> None:
+        addr = _mdns_host(port)
+        if addr:
+            mdns_result["addr"] = addr
+
+    mdns_thread = threading.Thread(target=_mdns, daemon=True)
+    mdns_thread.start()
+
+    devices = asyncio.run(_discover_tcp_devices(port, networks, quiet=True))
+    if not devices and mdns_result.get("addr"):
+        devices = asyncio.run(_discover_tcp_devices(
+            port, [{"network": ipaddress.IPv4Network(
+                f"{mdns_result['addr']}/32", strict=False)}], quiet=True))
+    return devices
+
+
+def parse_transport_text(raw: str) -> Optional[dict]:
+    """Turn a typed address into a transport: IP, COM port or BLE address.
+
+    The same rules as the console's "enter the address by hand" item, kept
+    in one place so both front ends accept exactly the same input.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    upper = text.upper()
+    if upper.startswith("COM"):
+        return {"kind": "serial", "target": upper,
+                "label": f"{upper} (USB)"}
+    if text.count(".") == 3 and text.replace(".", "").isdigit():
+        return {"kind": "tcp", "target": text,
+                "label": f"{text}:{MESHTASTIC_TCP_PORT} (Wi-Fi)"}
+    return {"kind": "ble", "target": text, "label": f"{text} (BLE)"}
+
+
 def _print_devices(devices: List[dict]) -> None:
     for i, dev in enumerate(devices, 1):
         print(f"  {i}) {dev['label']}")
@@ -3865,6 +3955,103 @@ def chat_from_config(cfg: dict) -> dict:
     if "meshtastic_channel" in cfg:
         return {"kind": "channel", "index": int(cfg["meshtastic_channel"] or 0)}
     return {"kind": "all"}
+
+
+def save_transport(path: Optional[str], transport: dict) -> None:
+    """Remember the chosen radio, the way the console menu does.
+
+    Only the radio goes into the file.  The phone is confirmed on every start
+    and its identity is never written anywhere (see DEVELOPMENT.md §7).
+    """
+    if not path:
+        return
+    try:
+        cfg = load_config(path)
+        cfg["transport"] = {k: v for k, v in transport.items()
+                            if k in ("kind", "target", "port")}
+        save_config(path, cfg)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Не удалось сохранить радио: %s", exc)
+
+
+def save_forward_mode(path: Optional[str], mode: str) -> None:
+    """Remember only the mode, never the list of extra phones."""
+    if not path:
+        return
+    try:
+        cfg = load_config(path)
+        cfg["bitchat_forward"] = mode
+        save_config(path, cfg)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Не удалось сохранить режим пересылки: %s", exc)
+
+
+def describe_chat_target(mesh: "MeshtasticHandler", chat: dict) -> str:
+    """Whether *chat* exists on the connected radio, in one honest line.
+
+    The console asks the radio itself when the owner picks a chat; the
+    window asks the same question here.  A connection is read, never made:
+    an offline radio means "not checked yet", not "wrong".
+    """
+    kind = (chat or {}).get("kind")
+    if kind == "all":
+        return "Всё: каналы и личные сообщения — разрешено."
+    if kind != "channel":
+        return "Личный чат выбирается списком узлов этого радио."
+    index = int((chat or {}).get("index", 0))
+    try:
+        if mesh.interface is None:
+            return (f"Канал {index}: радио ещё не на связи, проверка будет "
+                    "при запуске.")
+        if mesh.channel_exists(index):
+            return f"Канал {index} ({mesh.channel_label(index)}): есть на радио."
+        return (f"Канала {index} на этом радио нет — выберите другой или "
+                "«всё».")
+    except Exception as exc:  # noqa: BLE001
+        return f"Канал {index} не проверен: {exc}"
+
+
+def list_chat_entries(mesh: "MeshtasticHandler") -> List[dict]:
+    """The radio's chats as pickable items (channels + "all").
+
+    Same labels as the console's "choose a chat" menu; the direct chat with
+    one node is a separate item there and in the window, so it is not here.
+    """
+    entries: List[dict] = []
+    for i, ch in enumerate(mesh._channels()):
+        if not mesh._is_enabled(ch):
+            continue
+        name = _channel_display_name(ch, i)
+        if name and name.lower() != "primary":
+            label = name
+        elif i == 0:
+            label = "Общий канал"
+        else:
+            label = f"Канал {i}"
+        entries.append({"label": label, "target": {"kind": "channel",
+                                                   "index": i}})
+    entries.append({"label": "Всё: каналы и личные сообщения",
+                    "target": {"kind": "all"}})
+    return entries
+
+
+def list_nodes(mesh: "MeshtasticHandler") -> List[dict]:
+    """The radio's node database, most recently heard first."""
+    try:
+        nodes = [n for n in (mesh.interface.nodes or {}).values()
+                 if n.get("num") is not None]
+    except Exception:  # noqa: BLE001
+        nodes = []
+    nodes.sort(key=lambda n: n.get("lastHeard") or 0, reverse=True)
+    out = []
+    for node in nodes:
+        user = node.get("user") or {}
+        name = user.get("longName") or user.get("shortName") or "?"
+        nid = user.get("id") or f"!{int(node['num']):08x}"
+        out.append({"label": f"{name} — {nid}",
+                    "target": {"kind": "dm", "node": node.get("num")},
+                    "name": name})
+    return out
 
 
 # --------------------------------------------------------------------------

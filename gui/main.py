@@ -31,9 +31,10 @@ def _config_from_file(path: str) -> dict:
 def build_config(argv: Optional[List[str]] = None) -> EngineConfig:
     """Read ``config.json`` and the usual command line flags.
 
-    The device menu of the console cannot run inside a window, so transport
-    and chat come from the file or the flags; the phone is chosen by the
-    same scan the console uses.
+    The device menu now lives in the window: when the config names no radio
+    and no flag was given, the config is still returned but nothing starts
+    until the owner picks a radio on the «Устройства» page — the same rule
+    as the console, which shows its menu unless ``--no-menu`` is passed.
     """
     args = bridge.parse_args(list(argv if argv is not None else sys.argv[1:]))
     cfg_file = _config_from_file(getattr(args, "config",
@@ -78,19 +79,41 @@ def build_config(argv: Optional[List[str]] = None) -> EngineConfig:
     )
 
 
-def window_for_ui_test(cfg: EngineConfig) -> MainWindow:
+def window_for_ui_test(cfg: EngineConfig, finder=None) -> MainWindow:
     """The real window that never touches a radio or a phone.
 
-    Used by the UI checks: real widgets, real event plumbing, no engine.
+    Used by the UI checks: real widgets, real event plumbing, no engine and
+    no real search (``finder`` replaces the searcher when one is given).
     """
-    return MainWindow(cfg, autostart=False)
+    return MainWindow(cfg, autostart=False, finder=finder)
+
+
+def wanted_menu(argv: Optional[List[str]] = None) -> bool:
+    """True when the console would open its device menu.
+
+    ``--menu`` asks for it, ``--no-menu`` refuses it; otherwise the menu is
+    shown when no radio was given on the command line (the same condition
+    ``bridge.main`` uses, minus the console-only ``isatty`` check).
+    """
+    args = bridge.parse_args(list(argv if argv is not None else sys.argv[1:]))
+    if getattr(args, "menu", False):
+        return True
+    if getattr(args, "no_menu", False):
+        return False
+    return not (args.host or args.port or args.ble_address)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_TITLE)
     cfg = build_config(argv)
-    window = MainWindow(cfg, autostart=True)
+    if wanted_menu(argv):
+        # Like the console: nothing starts until a radio is chosen.  The
+        # phone may be confirmed before or after the start.
+        window = MainWindow(cfg, autostart=False)
+        window.tabs.setCurrentIndex(0)
+    else:
+        window = MainWindow(cfg, autostart=True)
     window.show()
     return app.exec()
 

@@ -128,6 +128,37 @@ class EngineSession(QObject):
                              is_bound=item["bound"])
                 for item in self.session.ble.get_stats()["peers"]]
 
+    # ------------------------------------------------------------ binding
+    def start_with(self, transport: Optional[dict],
+                   chat: Optional[dict],
+                   phone: Optional[dict]) -> bool:
+        """Start the engine on devices the window already chose.
+
+        Same effect as the console menu: the radio is remembered in the
+        config file, the confirmed phone is bound before the scanner runs.
+        Returns ``False`` when the bridge was already running.
+        """
+        bridge_session = self.session
+        cfg = bridge_session.cfg
+        if bridge_session.alive:
+            return False
+        if transport:
+            cfg.transport = dict(transport)
+            bridge.save_transport(cfg.config_path, transport)
+        if chat:
+            cfg.chat_target = dict(chat)
+            if chat.get("kind") == "channel":
+                cfg.channel = int(chat.get("index", 0))
+        if phone and phone.get("peer"):
+            cfg.bitchat_peer = str(phone["peer"]).lower()
+            cfg.bitchat_key = phone.get("signing_pub")
+            cfg.bitchat_nickname = phone.get("nickname") or ""
+            cfg.bitchat_fingerprint = phone.get("fingerprint") or ""
+            cfg.bitchat_target = None
+        cfg.ready = True
+        bridge_session.start()
+        return True
+
     # --------------------------------------------------------- forward mode
     def set_forward_mode(self, mode: str, sources=None,
                          confirmed: bool = False) -> bool:
@@ -274,6 +305,17 @@ class EngineSession(QObject):
             return f"расписание не принято: {exc}"
         self._calm_emit(ev.ScheduleEvent(self.session.scheduler.describe()))
         return ""
+
+    def check_chat(self, chat: Optional[dict]) -> str:
+        """Ask the live radio whether the chosen chat exists there.
+
+        Same question the console puts to the radio after the chat menu;
+        the answer is text for the window, the engine still makes its own
+        final decision when a message arrives.
+        """
+        if not self.ready or self.session.mesh is None:
+            return ""
+        return bridge.describe_chat_target(self.session.mesh, chat or {})
 
     # ------------------------------------------------------------ binding
     def reset_binding(self) -> None:

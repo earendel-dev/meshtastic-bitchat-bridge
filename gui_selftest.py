@@ -19,6 +19,7 @@ application itself.  Exit code 0 means every check passed.
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 import time
@@ -32,16 +33,19 @@ os.chdir(ROOT)
 from PySide6.QtCore import QPoint, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QWidget  # noqa: E402
 import gui.pages.connections as connections_page  # noqa: E402
+import gui.pages.devices as devices_page  # noqa: E402
 import gui.pages.forward as forward_page  # noqa: E402
 import gui.pages.session_bridge as session_bridge  # noqa: E402
 import gui.pages.sync as sync_page  # noqa: E402
 import gui.widgets.dialogs as dialogs  # noqa: E402
 from gui.core import events as ev  # noqa: E402
+from gui.core.search import Finder  # noqa: E402
 from gui.core.session import EngineConfig  # noqa: E402
-from gui.main import window_for_ui_test  # noqa: E402
+from gui.main import wanted_menu, window_for_ui_test  # noqa: E402
 from gui.pages.activity import LogPage  # noqa: E402
 from gui.pages.base import Page  # noqa: E402
 from gui.pages.connections import ConnectionsPage  # noqa: E402
+from gui.pages.devices import DevicesPage  # noqa: E402
 from gui.pages.forward import ForwardPage  # noqa: E402
 from gui.pages.overview import OverviewPage  # noqa: E402
 from gui.pages.sync import SyncPage  # noqa: E402
@@ -64,11 +68,33 @@ def section(title: str) -> None:
 
 
 def pump(ms: int = 60) -> None:
-    """Let Qt deliver queued signals and run its timers."""
-    end = time.monotonic() + ms / 1000.0
-    while time.monotonic() < end:
-        QApplication.processEvents()
+    """Let Qt deliver queued signals and run its timers.
+
+    Several threads work at once here (search, engine, the Meshtastic
+    library).  Python's own garbage collector may walk their objects exactly
+    while one of them is inside a native call; the collection is therefore
+    left for the moment the test really waits for something (see
+    ``collect``), never to a chance pause between two events.
+    """
+    gc_was_on = gc.isenabled()
+    gc.disable()
+    try:
+        end = time.monotonic() + ms / 1000.0
+        while time.monotonic() < end:
+            QApplication.processEvents()
+            time.sleep(0.005)
+    finally:
+        if gc_was_on:
+            gc.enable()
+
+
+def collect() -> None:
+    """Run a garbage collection at a point where the test is in control."""
+    deadline = time.monotonic() + 0.2
+    while time.monotonic() < deadline:
+        gc.collect(0)
         time.sleep(0.005)
+    gc.collect()
 
 
 class FakeEngine:
@@ -159,6 +185,49 @@ class FakeEngine:
         self.calls.append(("reset",))
 
 
+class FakeFinder(Finder):
+    """A searcher that answers from canned lists instead of the hardware."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = []
+        self.radios_found = [{"kind": "tcp", "target": "192.0.2.10",
+                              "port": 4403,
+                              "label": "Радио — 192.0.2.10:4403 (Wi-Fi)"}]
+        self.phones_found = [{
+            "kind": "bitchat", "target": "AA:BB:CC:DD:EE:01",
+            "peer": "aa" * 8, "nickname": "Мой телефон",
+            "fingerprint": "AAAA-BBBB-CCCC", "signing_pub": b"k" * 32,
+            "rssi": -48, "label": "Телефон",
+        }]
+        self.chats_found = ([{"label": "Общий канал",
+                              "target": {"kind": "channel", "index": 0}},
+                             {"label": "Семья",
+                              "target": {"kind": "channel", "index": 1}},
+                             {"label": "Всё",
+                              "target": {"kind": "all"}}],
+                            [{"label": f"Узел {i} — !{i:08x}",
+                              "target": {"kind": "dm", "node": i},
+                              "name": f"Узел {i}"} for i in range(45)])
+
+    def find_radios(self, kind: str) -> None:
+        self.calls.append(("radios", kind))
+        self.radios.emit([dict(item) for item in self.radios_found])
+
+    def find_phones(self, seconds: float) -> None:
+        self.calls.append(("phones", seconds))
+        self.phones.emit([dict(item) for item in self.phones_found])
+
+    def find_chats(self, transport) -> None:
+        self.calls.append(("chats", dict(transport or {})))
+        entries, nodes = self.chats_found
+        self.chats.emit([dict(item) for item in entries],
+                        [dict(item) for item in nodes])
+
+    def fail_radios(self, text: str) -> None:
+        self.radios_failed.emit(text)
+
+
 class Dialogue:
     """Replaces both confirmation dialogs; records the questions."""
 
@@ -174,7 +243,7 @@ class Dialogue:
 def install_dialogs():
     """Route the modal confirmations of every page through one place."""
     dialogue = Dialogue()
-    for module in (forward_page, sync_page, connections_page):
+    for module in (forward_page, sync_page, connections_page, devices_page):
         module.confirm_twice = dialogue.twice
     dialogs.confirm_twice = dialogue.twice
     return dialogue
@@ -273,24 +342,26 @@ def phase_window() -> None:
     pump()
 
     titles = [win.tabs.tabText(i) for i in range(win.tabs.count())]
-    check("пять вкладок", len(win.pages) == 5, str(len(win.pages)))
+    check("шесть вкладок", len(win.pages) == 6, str(len(win.pages)))
     check("названия вкладок",
           [p.title for p in win.pages] ==
-          ["Обзор", "Пересылка Bitchat → LoRa", "Синхронизация",
+          ["Устройства", "Обзор", "Пересылка Bitchat → LoRa", "Синхронизация",
            "Подключения", "Журнал"],
           str([p.title for p in win.pages]))
     check("вкладки подписаны значками",
-          len(titles) == 5 and all(t and len(t) <= 2 for t in titles),
+          len(titles) == 6 and all(t and len(t) <= 2 for t in titles),
           str(titles))
     check("у каждой вкладки есть полная подсказка",
           all(win.tabs.tabToolTip(i) for i in range(win.tabs.count())))
+    check("«Устройства» — первая вкладка",
+          isinstance(win.pages[0], DevicesPage))
     check("мост не запущен", not win._bridge.alive)
     check("состояние «остановлен»", win.core_state == "stopped")
     check("«Стоп» выключен, «Старт» включён",
           win.btn_start.isEnabled() and not win.btn_stop.isEnabled())
 
     # Every tab in turn, twice (back and forth): nothing may raise.
-    for order in (range(5), reversed(range(5))):
+    for order in (range(6), reversed(range(6))):
         for i in order:
             win.tabs.setCurrentIndex(i)
             pump(5)
@@ -632,6 +703,21 @@ def phase_window() -> None:
         check(f"окно {width}×{height}: ничего не вылезает", not problems,
               "; ".join(problems[:4]))
 
+    # A long radio / chat / phone name must wrap, not widen the page.
+    win.devices.set_transport({"kind": "tcp", "target": "192.0.2.10",
+                               "label": "Очень длинное имя радио — "
+                                        "192.0.2.10:4403 (Wi-Fi)"})
+    win.devices.on_chats([{"label": "Длинное имя канала " * 3,
+                           "target": {"kind": "channel", "index": 2}}], [])
+    win.devices.chat_combo.setCurrentIndex(0)
+    win.devices.on_phones([{"peer": "aa" * 8, "nickname": "Телефон с очень "
+                                                         "длинным именем",
+                            "fingerprint": "AAAA-BBBB-CCCC-DDDD"}])
+    for width, height in ((520, 480), (600, 520)):
+        problems = layout_problems(win, width, height)
+        check(f"длинные имена при {width}×{height} тоже влезают", not problems,
+              "; ".join(problems[:4]))
+
     win.resize(980, 760)
     pump()
 
@@ -657,6 +743,179 @@ def phase_window() -> None:
     check("движок запущен", win._bridge.alive)
     win._bridge.request_stop()
     pump(50)
+
+    # ------------------------------------------------- device tab (п. 1)
+    section("9a. Устройства: радио, беседа, телефон, запуск")
+    finder = FakeFinder()
+    cfg_dev = EngineConfig(transport=None, config_path=os.path.join(
+        ROOT, "var", "gui-selftest-config.json"))
+    with open(cfg_dev.config_path, "w", encoding="utf-8") as fh:
+        fh.write("{}")
+    dev_win = window_for_ui_test(cfg_dev, finder=finder)
+    dev_win.show()
+    pump(40)
+    dev = dev_win.pages[page_index(dev_win, DevicesPage)]
+    check("поиск подменён на вкладке «Устройства»", dev.finder is finder)
+    check("без радио мост не стартует",
+          not dev.btn_start.isEnabled() and dev.transport is None)
+    check("беседа и телефон пусты",
+          dev.chat is None and dev.phone is None)
+
+    dialogue = install_dialogs()
+    dev._start()
+    check("«Запустить» без радио ничего не запускает",
+          not dev_win._bridge.alive, dev.status.text())
+
+    # ---- radio: three searches, like the console's first menu
+    for kind in ("wifi", "ble", "serial"):
+        dev.btn_use_radio.setEnabled(True)
+        dev._search_radio(kind)
+        check(f"поиск радио «{kind}» спрошен",
+              finder.calls[-1] == ("radios", kind))
+        pump(20)
+    check("найденное радио попало в список", dev.radio_list.count() == 1,
+          str(dev.radio_list.count()))
+    check("«Подключить» доступно после поиска", dev.btn_use_radio.isEnabled())
+
+    adopted = []
+    dev.start_requested.connect(lambda: adopted.append(dev.transport))
+    dev._use_selected_radio()
+    pump()
+    check("радио выбрано из списка",
+          dev.transport == finder.radios_found[0], str(dev.transport))
+    check("радио подписано в окне",
+          "192.0.2.10" in dev.radio_value.text(), dev.radio_value.text())
+    check("с радио «Запустить» доступно", dev.btn_start.isEnabled())
+    import json
+    with open(cfg_dev.config_path, encoding="utf-8") as fh:
+        saved = json.load(fh)
+    check("радио записано в config.json",
+          saved.get("transport", {}).get("target") == "192.0.2.10",
+          str(saved.get("transport")))
+    check("телефон в config.json не пишется",
+          "phone" not in json.dumps(saved) and
+          "bitchat_peer" not in saved, str(sorted(saved)))
+
+    # ---- radio typed by hand: the same rules as the console
+    for text, kind in (("192.0.2.55", "tcp"), ("COM7", "serial"),
+                       ("AA:BB:CC:DD:EE:FF", "ble")):
+        dev.manual.setText(text)
+        dev._manual_radio()
+        check(f"адрес «{text}» разобран как {kind}",
+              dev.transport is not None and dev.transport.get("kind") == kind,
+              str(dev.transport))
+    dev.manual.setText("   ")
+    dev._manual_radio()
+    check("пустой адрес не принимается", dev.transport.get("kind") == "ble")
+    dev.on_radios(finder.radios_found)
+    dev._use_selected_radio()
+
+    # ---- chat: channels, then a direct chat from the node list
+    dev._load_chats()
+    pump(20)
+    check("список бесед запрошен", finder.calls[-1][0] == "chats")
+    check("каналы и «всё» в списке", dev.chat_combo.count() == 4,
+          str(dev.chat_combo.count()))
+    dev.chat_combo.setCurrentIndex(1)
+    pump(10)
+    check("канал выбран", dev.chat == {"kind": "channel", "index": 1},
+          str(dev.chat))
+    check("личный чат — отдельный пункт",
+          dev.chat_combo.itemText(3).startswith("Личный чат"),
+          dev.chat_combo.itemText(3))
+    dev.chat_combo.setCurrentIndex(3)
+    pump(10)
+    check("список узлов показан", dev.node_list.isVisible() or
+          dev.node_list.count() == 30)
+    check("узлы разбиты по страницам",
+          dev.node_list.count() == 30 and "1/2" in dev.page_label.text(),
+          dev.page_label.text())
+    dev._turn_page(1)
+    check("вторая страница узлов", dev.node_list.count() == 15,
+          str(dev.node_list.count()))
+    dev._node_chosen(dev.node_list.item(0))
+    check("личный чат с узлом выбран",
+          dev.chat.get("kind") == "dm" and dev.chat.get("node") == 30,
+          str(dev.chat))
+    check("личный чат подписан", "30" in dev.chat_value.text(),
+          dev.chat_value.text())
+    # The window mirrors the engine every 200 ms; let it settle.
+    pump(60)
+
+    # ---- phone: two confirmations, refusal keeps the bridge unbinding
+    finder.phones_found = []
+    dev._scan_phones()
+    pump(20)
+    dev.on_phones([])
+    check("пустой поиск телефонов объяснён", "не ответил" in dev.status.text(),
+          dev.status.text())
+    finder.phones_found = FakeFinder().phones_found
+    dev._scan_phones()
+    pump(20)
+    check("телефон найден", dev.phone_list.count() == 1)
+    check("до подтверждения телефон не выбран", dev.phone is None)
+    dialogue.answer = False
+    dev._confirm_phone()
+    check("отказ в подтверждении — телефон не выбран",
+          dev.phone is None and dev.status.text() == "Телефон не подтверждён.",
+          dev.status.text())
+    check("без телефона запуск всё равно возможен",
+          dev.btn_start.isEnabled(),
+          f"start={dev.btn_start.isEnabled()} run={dev._running} "
+          f"busy={dev._busy_now} transport={bool(dev.transport)}")
+    # The window keeps mirroring the engine on its timer; give it a moment
+    # so the page settles before the next confirmation.
+    pump(60)
+    dialogue.answer = True
+    dev._confirm_phone()
+    check("подтверждённый телефон запомнен",
+          dev.phone is not None and dev.phone.get("peer") == "aa" * 8)
+    check("подтверждение спрашивает дважды", dialogue.asked >= 2,
+          str(dialogue.asked))
+    check("в подписи — имя и отпечаток",
+          "Мой телефон" in dev.phone_value.text()
+          and "AAAA" in dev.phone_value.text(), dev.phone_value.text())
+    check("«можно запускать» после подтверждения",
+          "Можно запускать" in dev.ready_value.text(), dev.ready_value.text())
+
+    # ---- start: the window hands its choice to the engine
+    called = {}
+    original = dev_win.start_bridge
+    dev_win.start_bridge = lambda transport=None, chat=None, phone=None: \
+        called.update(transport=transport, chat=chat, phone=phone)
+    dev._start()
+    pump(10)
+    dev_win.start_bridge = original
+    check("запуск передаёт выбранное радио, чат и телефон",
+          called.get("transport", {}).get("target") == "192.0.2.10"
+          and called.get("chat", {}).get("kind") == "dm"
+          and called.get("phone", {}).get("peer") == "aa" * 8,
+          str({k: type(v) for k, v in called.items()}))
+    check("на запуске кнопки поиска гаснут", not dev.btn_wifi.isEnabled(),
+          f"run={dev._running} busy={dev._busy_now} "
+          f"status={dev.status.text()!r}")
+    dev.set_busy(True)
+    check("пока мост работает, «Остановить» доступно",
+          dev.btn_stop.isEnabled() and not dev.btn_start.isEnabled())
+    dev.set_busy(False)
+    check("после остановки поиск снова доступен", dev.btn_wifi.isEnabled())
+
+    problems = layout_problems(dev_win, 520, 480)
+    check("вкладка «Устройства» влезает в минимальное окно", not problems,
+          "; ".join(problems[:4]))
+    dev_win.close()
+    pump(30)
+    os.remove(cfg_dev.config_path)
+
+    # The console shows its menu unless a radio is given; the window now
+    # follows the same rule instead of silently starting from the file.
+    section("9b. Когда окно ждёт выбора устройства")
+    check("без --host окно ждёт выбора", wanted_menu(["--config", "x.json"]))
+    check("с --host запускается сразу",
+          not wanted_menu(["--host", "192.0.2.10"]))
+    check("--menu просит выбор даже с --host",
+          wanted_menu(["--host", "192.0.2.10", "--menu"]))
+    check("--no-menu отменяет выбор", not wanted_menu(["--no-menu"]))
 
     win.close()
     pump(30)
@@ -721,7 +980,6 @@ def phase_engine() -> None:
     session.sync_to_bitchat(5)
     pump(200)
     check("ручная синхронизация не падает без данных", True)
-
     reason = session.schedule("bit2lora", 5, 900)
     check("расписание добавляется", reason == "", reason)
     described = session.snapshot().schedule if session.snapshot() else ""
@@ -733,8 +991,103 @@ def phase_engine() -> None:
     session.reset_binding()
     pump(120)
     check("сброс привязки не падает", session.stats().get("bound") is False)
+    collect()
 
-    # Automatic liveness: the ticker must fire at least twice.
+
+    # Nothing may outlive this window: the engine thread is stopped here,
+    # not left to the garbage collector.
+    # The engine of this block is running on a radio that is not there: it
+    # retries in the background.  It must be stopped before the window goes,
+    # or its thread would outlive the window that owns the engine.
+    win.stop_bridge()
+    deadline = time.monotonic() + 20
+    while bridge.alive and time.monotonic() < deadline:
+        pump(100)
+    check("движок §10 остановлен перед следующей проверкой", not bridge.alive)
+    win.close()
+    pump(50)
+    # ---- §10a: engine started from the device page (bound before scan)
+    section("10a. Движок, запущенный с выбранными устройствами")
+    finder = FakeFinder()
+    phone = dict(finder.phones_found[0])
+    dev_cfg_path = os.path.join(ROOT, "var", "gui-selftest-engine.json")
+    with open(dev_cfg_path, "w", encoding="utf-8") as fh:
+        fh.write("{}")
+    cfg2 = EngineConfig(transport=None, ready=False, config_path=dev_cfg_path)
+    dev_win = window_for_ui_test(cfg2, finder=finder)
+    dev_win.show()
+    pump(30)
+    dev = dev_win.pages[page_index(dev_win, DevicesPage)]
+    dev.on_radios(finder.radios_found)
+    dev._use_selected_radio()
+    dev.on_chats(*finder.chats_found)
+    dev.chat_combo.setCurrentIndex(1)          # канал 1, а не «всё»
+    dev.on_phones(finder.phones_found)
+    install_dialogs().answer = True
+    dev._confirm_phone()
+    # The radio of this check is the local closed port: its target is
+    # replaced so nothing is said about an address that is not in use.
+    dev._adopt_radio({"kind": "tcp", "target": "127.0.0.1:1",
+                      "label": "локальный порт (проверка)"})
+    dev._start()
+    pump(20)
+    dev_bridge = dev_win._bridge
+    check("мост поднялся из вкладки «Устройства»",
+          dev_bridge.wait_ready(20.0))
+    pump(400)
+    dev_session = dev_win.session
+    dev_stats = dev_session.stats()
+    check("телефон привязан ещё до поиска",
+          dev_stats.get("bound") is True, str(dev_stats.get("bound")))
+    check("привязан именно выбранный",
+          dev_stats.get("bound") is True and
+          dev_stats.get("bound_label") == phone["nickname"],
+          str(dev_stats.get("bound_label")))
+    check("подпись ключа взята из announce",
+          bool(dev_stats.get("bound_fingerprint")),
+          str(dev_stats.get("bound_fingerprint")))
+    check("выбранный канал дошёл до движка",
+          dev_stats.get("forward_mode") == "bound"
+          and getattr(dev_bridge.cfg, "channel", None) == 1,
+          f'channel={getattr(dev_bridge.cfg, "channel", None)}')
+    check("радио в конфиге — выбранное",
+          getattr(dev_bridge.cfg.transport, "get", lambda *_: None)(
+              "target") == "127.0.0.1:1")
+    pump(400)
+    check("вкладка знает, кого ждёт", dev.phone["nickname"] in
+          dev.ready_value.text(), dev.ready_value.text())
+    check("пока мост работает, поиск выключен и «Остановить» доступно",
+          not dev.btn_wifi.isEnabled() and dev.btn_stop.isEnabled(),
+          f"run={dev._running} busy={dev._busy_now} "
+          f"wifi={dev.btn_wifi.isEnabled()} stop={dev.btn_stop.isEnabled()} "
+          f"alive={dev_bridge.alive}")
+    dev.btn_stop.click()
+    deadline = time.monotonic() + 20
+    while dev_bridge.alive and time.monotonic() < deadline:
+        pump(100)
+    pump(400)
+    check("кнопка «Остановить» на вкладке останавливает мост",
+          not dev_bridge.alive)
+    check("после остановки снова можно выбирать",
+          dev.btn_wifi.isEnabled() and not dev.btn_stop.isEnabled())
+    check("окно говорит, что мост остановлен",
+          "остановлен" in dev.ready_value.text().lower(),
+          dev.ready_value.text())
+    dev_win.close()
+    pump(30)
+    deadline = time.monotonic() + 15
+    while dev_bridge.alive and time.monotonic() < deadline:
+        pump(100)
+    check("вкладка «Устройства» останавливает свой движок",
+          not dev_bridge.alive)
+    os.remove(dev_cfg_path)
+
+    # Section 10a of this block used the heartbeat of the engine above; the
+    # ticker is checked here, on a fresh engine of its own.
+    win.start_bridge()
+    pump(200)
+    check("запуск после остановки", win._bridge.alive)
+    session = win.session
     beats = []
     session.heartbeat.connect(lambda gap: beats.append(gap))
     deadline = time.monotonic() + 3.5
@@ -750,13 +1103,14 @@ def phase_engine() -> None:
     while bridge.alive and time.monotonic() < deadline:
         pump(100)
     check("остановка завершается", not bridge.alive)
-    check("окно показывает «остановлен»", win.core_state == "stopped")
-
-    win.start_bridge()
-    pump(200)
-    check("повторный запуск после остановки", win._bridge.alive)
     win.close()
-    pump(50)
+    # The state reaches the header through a queued signal of the engine
+    # thread: poll it the way the user would see it, without windows open.
+    deadline = time.monotonic() + 3.0
+    while win.core_state != "stopped" and time.monotonic() < deadline:
+        pump(100)
+    check("окно показывает «остановлен»", win.core_state == "stopped",
+          win.core_state)
     check("закрытие окна останавливает движок", not win._bridge.alive)
 
 
@@ -797,7 +1151,7 @@ def phase_exe() -> None:
         out = (run.stdout or "") + (run.stderr or "")
         check("exe импортирует движок и окно",
               "SELF-CHECK PASSED" in out, out.strip().splitlines()[-1:])
-        check("exe собирает окно", "window ok: 5 tabs" in out,
+        check("exe собирает окно", "window ok: 6 tabs" in out,
               out.strip()[-200:])
     else:
         check("консольный близнец для проверки собран", False,

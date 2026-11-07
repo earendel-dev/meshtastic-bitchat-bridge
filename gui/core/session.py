@@ -57,6 +57,16 @@ class EngineConfig:
     bitchat_peer: Optional[str] = None
     forward_mode: str = "bound"
     config_path: Optional[str] = None
+    # The window chooses the devices before any engine exists: the radio and
+    # the confirmed phone are handed in here and the engine starts bound to
+    # them, exactly as the console menu does before calling ``bridge.run``.
+    ready: bool = False
+    label: str = ""
+    # The signature the phone published in its announce, so the binding check
+    # starts with the key instead of learning it on the first packet.
+    bitchat_key: Optional[bytes] = None
+    bitchat_nickname: str = ""
+    bitchat_fingerprint: str = ""
 
 
 class BridgeSession(QObject):
@@ -92,6 +102,11 @@ class BridgeSession(QObject):
         self._thread = threading.Thread(target=self._run_engine,
                                         name="bridge-engine", daemon=True)
         self._thread.start()
+
+    @property
+    def alive(self) -> bool:
+        """True while the engine thread runs."""
+        return bool(self._thread and self._thread.is_alive())
 
     def _run_engine(self) -> None:
         loop = asyncio.new_event_loop()
@@ -142,6 +157,13 @@ class BridgeSession(QObject):
         self.scheduler = bridge.SyncScheduler()
         self._stop = asyncio.Event()
         self._last_tick = time.monotonic()
+        if cfg.ready:
+            # The window already found the radio and confirmed the phone, so
+            # binding happens here: the scanner only accepts that peer and
+            # never asks anything (no console to ask).
+            if cfg.bitchat_peer:
+                ble.bind_peer(cfg.bitchat_peer, cfg.bitchat_nickname,
+                              cfg.bitchat_fingerprint, cfg.bitchat_key)
         self._ready.set()
         self.started.emit()
 
@@ -149,6 +171,12 @@ class BridgeSession(QObject):
         self.event.emit(ev.LinkEvent(
             "radio", mesh.interface is not None, mesh.describe_target()))
         self.event.emit(ev.ChatTargetEvent(mesh.describe_target()))
+        if cfg.ready and mesh.interface is not None:            self.event.emit(ev.LogEvent(
+                f"Радио на связи: {mesh.describe_target()}", ev.Level.OK))
+        elif cfg.ready:
+            self.event.emit(ev.LogEvent(
+                "Радио не ответило: мост пробует снова в фоне.",
+                ev.Level.WARN))
 
         tasks = [
             asyncio.create_task(ble.scanner()),
